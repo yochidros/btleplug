@@ -3,7 +3,7 @@ use jni::{
     objects::{JClass, JList, JMap, JMethodID, JObject, JString},
     signature::{JavaType, Primitive},
     strings::JavaStr,
-    sys::jint,
+    sys::{jbyteArray, jint},
     JNIEnv,
 };
 use jni_utils::{future::JFuture, stream::JStream, uuid::JUuid};
@@ -680,22 +680,60 @@ impl<'a: 'b, 'b> TryFrom<JScanResult<'a, 'b>> for (BDAddr, Option<PeripheralProp
             };
 
             let rssi = Some(result.get_rssi()? as i16);
+            let raw_bytes = {
+                let arr = record.get_bytes()?;
+                result.env.convert_byte_array(arr)?
+            };
+            // parse AD structure here if needed
+            let mut index = 0;
+            let mut manufacturer_data: HashMap<u16, Vec<u8>> = HashMap::new();
 
-            let manufacturer_specific_data_array = record.get_manufacturer_specific_data()?;
-            let manufacturer_specific_data_obj: &JObject = &manufacturer_specific_data_array;
-            let mut manufacturer_data = HashMap::new();
-            if !result
-                .env
-                .is_same_object(manufacturer_specific_data_obj.clone(), JObject::null())?
-            {
-                for item in manufacturer_specific_data_array.iter() {
-                    let (index, data) = item?;
-
-                    let index = index as u16;
-                    let data = jni_utils::arrays::byte_array_to_vec(result.env, data.into_inner())?;
-                    manufacturer_data.insert(index, data);
+            while index < raw_bytes.len() {
+                let length = raw_bytes[index] as usize;
+                if length == 0 {
+                    break;
                 }
+
+                if index + length >= raw_bytes.len() {
+                    break;
+                }
+
+                let ad_type = raw_bytes[index + 1] as u8;
+                if ad_type == 0xFF {
+                    // Manufacturer Specific Data
+                    let company_id =
+                        ((raw_bytes[index + 3] as u16) << 8) | (raw_bytes[index + 2] as u16);
+
+                    let data_start = index + 4;
+                    let data_end = index + 1 + length;
+                    if data_end <= raw_bytes.len() {
+                        let data = raw_bytes[data_start..data_end].to_vec();
+
+                        manufacturer_data
+                            .entry(company_id)
+                            .and_modify(|v| v.extend_from_slice(&data))
+                            .or_insert(data);
+                    }
+                }
+
+                index += length + 1;
             }
+
+            // let manufacturer_specific_data_array = record.get_manufacturer_specific_data()?;
+            // let manufacturer_specific_data_obj: &JObject = &manufacturer_specific_data_array;
+            // let mut manufacturer_data = HashMap::new();
+            // if !result
+            //     .env
+            //     .is_same_object(manufacturer_specific_data_obj.clone(), JObject::null())?
+            // {
+            //     for item in manufacturer_specific_data_array.iter() {
+            //         let (index, data) = item?;
+            //
+            //         let index = index as u16;
+            //         let data = jni_utils::arrays::byte_array_to_vec(result.env, data.into_inner())?;
+            //         manufacturer_data.insert(index, data);
+            //     }
+            // }
 
             let service_data_map = record.get_service_data()?;
             let service_data_obj: &JObject = &service_data_map;
@@ -750,6 +788,7 @@ pub struct JScanRecord<'a: 'b, 'b> {
     get_device_name: JMethodID<'a>,
     get_tx_power_level: JMethodID<'a>,
     get_manufacturer_specific_data: JMethodID<'a>,
+    get_bytes: JMethodID<'a>,
     get_service_data: JMethodID<'a>,
     get_service_uuids: JMethodID<'a>,
     env: &'b JNIEnv<'a>,
@@ -783,11 +822,14 @@ impl<'a: 'b, 'b> JScanRecord<'a, 'b> {
         let get_service_data = env.get_method_id(&class, "getServiceData", "()Ljava/util/Map;")?;
         let get_service_uuids =
             env.get_method_id(&class, "getServiceUuids", "()Ljava/util/List;")?;
+
+        let get_bytes = env.get_method_id(&class, "getBytes", "()[B")?;
         Ok(Self {
             internal: obj,
             get_device_name,
             get_tx_power_level,
             get_manufacturer_specific_data,
+            get_bytes,
             get_service_data,
             get_service_uuids,
             env,
@@ -829,6 +871,18 @@ impl<'a: 'b, 'b> JScanRecord<'a, 'b> {
             )?
             .l()?;
         JSparseArray::from_env(self.env, obj)
+    }
+    pub fn get_bytes(&self) -> Result<jbyteArray> {
+        let obj = self
+            .env
+            .call_method_unchecked(
+                self.internal,
+                self.get_bytes,
+                JavaType::Array(Box::new(JavaType::Primitive(Primitive::Byte))),
+                &[],
+            )?
+            .l()?;
+        Ok(obj.into_inner() as jbyteArray)
     }
 
     pub fn get_service_data(&self) -> Result<JMap<'a, 'b>> {
