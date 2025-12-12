@@ -132,9 +132,21 @@ impl Peripheral {
                     )) => {
                         let mut properties = shared.properties.lock().unwrap();
                         properties.rssi = Some(rssi);
-                        properties
-                            .manufacturer_data
-                            .insert(manufacturer_id, data.clone());
+
+                        match properties.manufacturer_data.get(&manufacturer_id) {
+                            Some(old) => {
+                                if old.len() < data.len() {
+                                    properties
+                                        .manufacturer_data
+                                        .insert(manufacturer_id, data.clone());
+                                }
+                            }
+                            _ => {
+                                properties
+                                    .manufacturer_data
+                                    .insert(manufacturer_id, data.clone());
+                            }
+                        }
                         shared.emit_event(CentralEvent::ManufacturerDataAdvertisement {
                             id: shared.uuid.into(),
                             manufacturer_data: properties.manufacturer_data.clone(),
