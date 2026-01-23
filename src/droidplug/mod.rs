@@ -5,7 +5,7 @@ pub mod peripheral;
 use ::jni::JNIEnv;
 use once_cell::sync::OnceCell;
 
-mod jni;
+pub mod jni;
 
 static GLOBAL_ADAPTER: OnceCell<adapter::Adapter> = OnceCell::new();
 
