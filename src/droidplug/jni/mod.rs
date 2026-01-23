@@ -7,7 +7,7 @@ use std::ffi::c_void;
 
 static GLOBAL_JVM: OnceCell<JavaVM> = OnceCell::new();
 
-pub fn init(env: &JNIEnv) -> crate::Result<()> {
+pub fn init(env: &mut JNIEnv) -> crate::Result<()> {
     if let Ok(()) = GLOBAL_JVM.set(env.get_java_vm()?) {
         jni_utils::init(env)?;
         env.register_native_methods(
@@ -70,7 +70,8 @@ impl From<::jni::errors::Error> for crate::Error {
 }
 
 extern "C" fn adapter_report_scan_result(env: JNIEnv, obj: JObject, scan_result: JObject) {
-    let _ = super::adapter::adapter_report_scan_result_internal(&env, obj, scan_result);
+    let mut env = env;
+    let _ = super::adapter::adapter_report_scan_result_internal(&mut env, obj, scan_result);
 }
 
 extern "C" fn adapter_on_connection_state_changed(
@@ -79,6 +80,11 @@ extern "C" fn adapter_on_connection_state_changed(
     addr: JString,
     connected: jboolean,
 ) {
-    let _ =
-        super::adapter::adapter_on_connection_state_changed_internal(&env, obj, addr, connected);
+    let mut env = env;
+    let _ = super::adapter::adapter_on_connection_state_changed_internal(
+        &mut env,
+        obj,
+        addr,
+        connected,
+    );
 }
