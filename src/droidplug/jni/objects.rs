@@ -352,7 +352,7 @@ impl<'a> JBluetoothGattService<'a> {
         Ok(uuid_obj.as_uuid()?)
     }
 
-    pub fn get_characteristics(&self) -> Result<Vec<JBluetoothGattCharacteristic>> {
+    pub fn get_characteristics(&self) -> Result<Vec<JBluetoothGattCharacteristic<'_>>> {
         let mut env = unsafe { self.env.unsafe_clone() };
         let obj = unsafe {
             env.call_method_unchecked(
@@ -434,7 +434,7 @@ impl<'a> JBluetoothGattCharacteristic<'a> {
         jni_utils::arrays::byte_array_to_vec(&mut env, JByteArray::from(value))
     }
 
-    pub fn get_descriptors(&self) -> Result<Vec<JBluetoothGattDescriptor>> {
+    pub fn get_descriptors(&self) -> Result<Vec<JBluetoothGattDescriptor<'_>>> {
         let mut env = unsafe { self.env.unsafe_clone() };
         let obj = unsafe {
             env.call_method_unchecked(
