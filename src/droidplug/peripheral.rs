@@ -235,7 +235,7 @@ impl api::Peripheral for Peripheral {
         self.with_obj(|_env, obj| Ok(obj.is_connected()?))
     }
 
-    async fn mtu(&self) -> Result<u16> {
+    async fn mtu(&self, _characteristics: Option<&[Characteristic]>) -> Result<u16> {
         self.with_obj(|env, obj| {
             let result = try_block(env, |_env| Ok(Ok(obj.get_mtu()?)))
                 .catch(

@@ -167,7 +167,7 @@ impl api::Peripheral for Peripheral {
         Ok(device_info.connected)
     }
 
-    async fn mtu(&self) -> Result<u16> {
+    async fn mtu(&self, _characteristics: Option<&[Characteristic]>) -> Result<u16> {
         if self.services.lock().map_err(Into::<Error>::into)?.is_empty() {
             self.discover_services().await?;
         }

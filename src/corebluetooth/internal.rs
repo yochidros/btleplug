@@ -455,6 +455,7 @@ pub enum CoreBluetoothMessage {
     },
     GetMtu {
         peripheral_uuid: Uuid,
+        characteristics: Option<Vec<Characteristic>>,
         future: CoreBluetoothReplyStateShared,
     },
 }
@@ -1210,8 +1211,12 @@ impl CoreBluetoothInternal {
                         data,
                         future,
                     } => self.write_descriptor_value(peripheral_uuid, service_uuid, characteristic_uuid, descriptor_uuid, data, future),
-                    CoreBluetoothMessage::GetMtu { peripheral_uuid, future } => {
-                        self.get_mtu(peripheral_uuid, future);
+                    CoreBluetoothMessage::GetMtu {
+                        peripheral_uuid,
+                        characteristics,
+                        future,
+                    } => {
+                        self.get_mtu(peripheral_uuid, characteristics, future);
                     }
                 };
             }
@@ -1225,19 +1230,56 @@ impl CoreBluetoothInternal {
             .set_reply(CoreBluetoothReply::AdapterState(state))
     }
 
-    fn get_mtu(&mut self, peripheral_uuid: Uuid, fut: CoreBluetoothReplyStateShared) {
+    fn get_mtu(
+        &mut self,
+        peripheral_uuid: Uuid,
+        characteristics: Option<Vec<Characteristic>>,
+        fut: CoreBluetoothReplyStateShared,
+    ) {
         if let Some(peripheral) = self.peripherals.get_mut(&peripheral_uuid) {
+            let (has_with_response, has_without_response) =
+                if let Some(characteristics) = characteristics.as_ref() {
+                    let has_with_response = characteristics.iter().any(|characteristic| {
+                        characteristic.properties.contains(CharPropFlags::WRITE)
+                    });
+                    let has_without_response = characteristics.iter().any(|characteristic| {
+                        characteristic
+                            .properties
+                            .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
+                    });
+                    (has_with_response, has_without_response)
+                } else {
+                    let has_with_response = peripheral.services.values().any(|service| {
+                        service.characteristics.values().any(|characteristic| {
+                            characteristic.properties.contains(CharPropFlags::WRITE)
+                        })
+                    });
+                    let has_without_response = peripheral.services.values().any(|service| {
+                        service.characteristics.values().any(|characteristic| {
+                            characteristic
+                                .properties
+                                .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
+                        })
+                    });
+                    (has_with_response, has_without_response)
+                };
+            let write_type = if has_without_response {
+                CBCharacteristicWriteType::CBCharacteristicWriteWithoutResponse
+            } else if has_with_response {
+                CBCharacteristicWriteType::CBCharacteristicWriteWithResponse
+            } else {
+                fut.lock().unwrap().set_reply(CoreBluetoothReply::Err(
+                    "Writable characteristic not found for MTU".to_string(),
+                ));
+                return;
+            };
             let max_len = unsafe {
                 peripheral
                     .peripheral
-                    .maximumWriteValueLengthForType(
-                        CBCharacteristicWriteType::CBCharacteristicWriteWithResponse,
-                    )
+                    .maximumWriteValueLengthForType(write_type)
             };
-            let mtu = (max_len as u16).saturating_add(3);
-            fut.lock()
-                .unwrap()
-                .set_reply(CoreBluetoothReply::Mtu(mtu));
+            let mtu = (max_len as u16);
+            fut.lock().unwrap().set_reply(CoreBluetoothReply::Mtu(mtu));
         } else {
             fut.lock().unwrap().set_reply(CoreBluetoothReply::Err(
                 "Peripheral not found for MTU".to_string(),

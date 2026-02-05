@@ -251,7 +251,8 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
     async fn is_connected(&self) -> Result<bool>;
 
     /// Returns the negotiated ATT MTU for this connection when available.
-    async fn mtu(&self) -> Result<u16>;
+    /// For CoreBluetooth, passing characteristics can influence the MTU calculation.
+    async fn mtu(&self, characteristics: Option<&[Characteristic]>) -> Result<u16>;
 
     /// Creates a connection to the device. If this method returns Ok there has been successful
     /// connection. Note that peripherals allow only one connection at a time. Operations that
