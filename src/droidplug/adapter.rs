@@ -93,7 +93,7 @@ impl Adapter {
     fn add(&self, address: BDAddr) -> Result<Peripheral> {
         let mut env = global_jvm().get_env()?;
         let adapter_obj = env.new_local_ref(self.internal.as_obj())?;
-        let peripheral = Peripheral::new(&mut env, adapter_obj, address)?;
+        let peripheral = Peripheral::new(&mut env, adapter_obj, address, Arc::downgrade(&self.manager))?;
         self.manager.add_peripheral(peripheral.clone());
         Ok(peripheral)
     }

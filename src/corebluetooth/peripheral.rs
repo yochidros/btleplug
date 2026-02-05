@@ -248,6 +248,7 @@ impl api::Peripheral for Peripheral {
                 CBPeripheralState::Connected => Ok(true),
                 _ => Ok(false),
             },
+            CoreBluetoothReply::NotFound => Err(Error::DeviceNotFound),
             _ => panic!("Shouldn't get anything but a State!"),
         }
     }
@@ -266,6 +267,7 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::Mtu(mtu) => Ok(mtu),
+            CoreBluetoothReply::NotFound => Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => Err(Error::RuntimeError(msg)),
             reply => panic!("Unexpected reply: {:?}", reply),
         }
@@ -287,6 +289,7 @@ impl api::Peripheral for Peripheral {
                 self.shared
                     .emit_event(CentralEvent::DeviceConnected(self.shared.uuid.into()));
             }
+            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             _ => panic!("Shouldn't get anything but connected or err!"),
         }
@@ -310,6 +313,7 @@ impl api::Peripheral for Peripheral {
                     .emit_event(CentralEvent::DeviceDisconnected(self.shared.uuid.into()));
                 trace!("Device disconnected!");
             }
+            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             _ => error!("Shouldn't get anything but Ok!"),
         }
         Ok(())
@@ -351,6 +355,7 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::Ok => {}
+            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             reply => panic!("Unexpected reply: {:?}", reply),
         }
@@ -371,6 +376,7 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::ReadResult(chars) => Ok(chars),
+            CoreBluetoothReply::NotFound => Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             _ => {
                 panic!("Shouldn't get anything but read result!");
@@ -392,6 +398,7 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::Ok => trace!("subscribed!"),
+            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             _ => panic!("Didn't subscribe!"),
         }
@@ -412,6 +419,7 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::Ok => {}
+            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             _ => panic!("Didn't unsubscribe!"),
         }
@@ -439,6 +447,7 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::Ok => {}
+            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             reply => panic!("Unexpected reply: {:?}", reply),
         }
         Ok(())
@@ -459,6 +468,7 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::ReadResult(chars) => Ok(chars),
+            CoreBluetoothReply::NotFound => Err(Error::DeviceNotFound),
             _ => {
                 panic!("Shouldn't get anything but read result!");
             }

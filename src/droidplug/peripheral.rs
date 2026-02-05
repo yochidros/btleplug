@@ -3,6 +3,7 @@ use crate::{
         self, BDAddr, Characteristic, Descriptor, PeripheralProperties, Service, ValueNotification,
         WriteType,
     },
+    common::adapter_manager::AdapterManager,
     Error, Result,
 };
 use async_trait::async_trait;
@@ -24,7 +25,7 @@ use std::{
     convert::TryFrom,
     fmt::{self, Debug, Display, Formatter},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use super::jni::{
@@ -146,6 +147,7 @@ struct PeripheralShared {
 pub struct Peripheral {
     addr: BDAddr,
     internal: GlobalRef,
+    adapter: Weak<AdapterManager<Peripheral>>,
     shared: Arc<Mutex<PeripheralShared>>,
 }
 
@@ -154,12 +156,14 @@ impl Peripheral {
         env: &mut JNIEnv<'a>,
         adapter: JObject<'a>,
         addr: BDAddr,
+        manager: Weak<AdapterManager<Peripheral>>,
     ) -> Result<Self> {
         let obj = JPeripheral::new(env, adapter, addr)?;
         let obj_ref: JObject = obj.into();
         Ok(Self {
             addr,
             internal: env.new_global_ref(&obj_ref)?,
+            adapter: manager,
             shared: Arc::new(Mutex::new(PeripheralShared {
                 services: BTreeSet::new(),
                 characteristics: BTreeSet::new(),
@@ -192,6 +196,7 @@ impl Peripheral {
         characteristic: &Characteristic,
         enable: bool,
     ) -> Result<()> {
+        self.ensure_available()?;
         let future = self.with_obj(|env, obj| {
             let uuid_obj = JUuid::new(env, characteristic.uuid)?;
             JSendFuture::try_from(obj.set_characteristic_notification(uuid_obj, enable)?)
@@ -201,6 +206,16 @@ impl Peripheral {
             let result = JPollResult::from_env(env, env.new_local_ref(result_ref.as_obj())?)?;
             get_poll_result(env, result).map(|_| {})
         })
+    }
+
+    fn ensure_available(&self) -> Result<()> {
+        let manager = self.adapter.upgrade().ok_or(Error::DeviceNotFound)?;
+        let id = PeripheralId(self.addr);
+        if manager.peripheral(&id).is_some() {
+            Ok(())
+        } else {
+            Err(Error::DeviceNotFound)
+        }
     }
 }
 
@@ -232,10 +247,12 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn is_connected(&self) -> Result<bool> {
+        self.ensure_available()?;
         self.with_obj(|_env, obj| Ok(obj.is_connected()?))
     }
 
     async fn mtu(&self, _characteristics: Option<&[Characteristic]>) -> Result<u16> {
+        self.ensure_available()?;
         self.with_obj(|env, obj| {
             let result = try_block(env, |_env| Ok(Ok(obj.get_mtu()?)))
                 .catch(
@@ -255,6 +272,7 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn connect(&self) -> Result<()> {
+        self.ensure_available()?;
         let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.connect()?))?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
@@ -264,6 +282,7 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn disconnect(&self) -> Result<()> {
+        self.ensure_available()?;
         let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.disconnect()?))?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
@@ -280,6 +299,7 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn discover_services(&self) -> Result<()> {
+        self.ensure_available()?;
         let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.discover_services()?))?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
@@ -341,6 +361,7 @@ impl api::Peripheral for Peripheral {
         data: &[u8],
         write_type: WriteType,
     ) -> Result<()> {
+        self.ensure_available()?;
         let future = self.with_obj(|env, obj| {
             let mut local_env = unsafe { env.unsafe_clone() };
             let uuid = JUuid::new(&mut local_env, characteristic.uuid)?;
@@ -359,6 +380,7 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn read(&self, characteristic: &Characteristic) -> Result<Vec<u8>> {
+        self.ensure_available()?;
         let future = self.with_obj(|env, obj| {
             let uuid = JUuid::new(env, characteristic.uuid)?;
             JSendFuture::try_from(obj.read(uuid)?)
@@ -373,11 +395,13 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn subscribe(&self, characteristic: &Characteristic) -> Result<()> {
+        self.ensure_available()?;
         self.set_characteristic_notification(characteristic, true)
             .await
     }
 
     async fn unsubscribe(&self, characteristic: &Characteristic) -> Result<()> {
+        self.ensure_available()?;
         self.set_characteristic_notification(characteristic, false)
             .await
     }
@@ -402,6 +426,7 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
+        self.ensure_available()?;
         let future = self.with_obj(|env, obj| {
             let mut local_env = unsafe { env.unsafe_clone() };
             let characteristic = JUuid::new(&mut local_env, descriptor.characteristic_uuid)?;
@@ -417,6 +442,7 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
+        self.ensure_available()?;
         let future = self.with_obj(|env, obj| {
             let characteristic = JUuid::new(env, descriptor.characteristic_uuid)?;
             let uuid = JUuid::new(env, descriptor.uuid)?;

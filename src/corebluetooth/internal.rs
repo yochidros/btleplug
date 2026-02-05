@@ -152,6 +152,7 @@ pub enum CoreBluetoothReply {
     State(CBPeripheralState),
     Mtu(u16),
     Ok,
+    NotFound,
     Err(String),
 }
 
@@ -856,6 +857,8 @@ impl CoreBluetoothInternal {
             trace!("Connecting peripheral!");
             p.connected_future_state = Some(fut);
             unsafe { self.manager.connectPeripheral_options(&p.peripheral, None) };
+        } else {
+            fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
         }
     }
 
@@ -865,6 +868,8 @@ impl CoreBluetoothInternal {
             trace!("Disconnecting peripheral!");
             p.disconnected_future_state = Some(fut);
             unsafe { self.manager.cancelPeripheralConnection(&p.peripheral) };
+        } else {
+            fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
         }
     }
 
@@ -875,6 +880,8 @@ impl CoreBluetoothInternal {
             fut.lock()
                 .unwrap()
                 .set_reply(CoreBluetoothReply::State(state));
+        } else {
+            fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
         }
     }
 
@@ -913,9 +920,11 @@ impl CoreBluetoothInternal {
                     } else {
                         characteristic.write_future_state.push_front(fut);
                     }
+                    return;
                 }
             }
         }
+        fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
     }
 
     fn read_value(
@@ -936,9 +945,11 @@ impl CoreBluetoothInternal {
                             .readValueForCharacteristic(&characteristic.characteristic);
                     }
                     characteristic.read_future_state.push_front(fut);
+                    return;
                 }
             }
         }
+        fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
     }
 
     fn subscribe(
@@ -959,9 +970,11 @@ impl CoreBluetoothInternal {
                             .setNotifyValue_forCharacteristic(true, &characteristic.characteristic);
                     }
                     characteristic.subscribe_future_state.push_front(fut);
+                    return;
                 }
             }
         }
+        fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
     }
 
     fn unsubscribe(
@@ -983,9 +996,11 @@ impl CoreBluetoothInternal {
                         );
                     }
                     characteristic.unsubscribe_future_state.push_front(fut);
+                    return;
                 }
             }
         }
+        fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
     }
 
     fn write_descriptor_value(
@@ -1010,10 +1025,12 @@ impl CoreBluetoothInternal {
                             );
                         }
                         descriptor.write_future_state.push_front(fut);
+                        return;
                     }
                 }
             }
         }
+        fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
     }
 
     fn read_descriptor_value(
@@ -1036,10 +1053,12 @@ impl CoreBluetoothInternal {
                                 .readValueForDescriptor(&descriptor.descriptor);
                         }
                         descriptor.read_future_state.push_front(fut);
+                        return;
                     }
                 }
             }
         }
+        fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
     }
 
     async fn on_descriptor_read(
@@ -1280,11 +1299,9 @@ impl CoreBluetoothInternal {
             };
             let mtu = (max_len as u16);
             fut.lock().unwrap().set_reply(CoreBluetoothReply::Mtu(mtu));
-        } else {
-            fut.lock().unwrap().set_reply(CoreBluetoothReply::Err(
-                "Peripheral not found for MTU".to_string(),
-            ));
+            return;
         }
+        fut.lock().unwrap().set_reply(CoreBluetoothReply::NotFound);
     }
 
     fn start_discovery(&mut self, filter: ScanFilter) {
