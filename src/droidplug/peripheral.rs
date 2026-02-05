@@ -235,6 +235,25 @@ impl api::Peripheral for Peripheral {
         self.with_obj(|_env, obj| Ok(obj.is_connected()?))
     }
 
+    async fn mtu(&self) -> Result<u16> {
+        self.with_obj(|env, obj| {
+            let result = try_block(env, |_env| Ok(Ok(obj.get_mtu()?)))
+                .catch(
+                    <&JClass>::from(
+                        jni_utils::classcache::get_class(
+                            "com/nonpolynomial/btleplug/android/impl/NotConnectedException",
+                        )
+                        .unwrap()
+                        .as_obj(),
+                    ),
+                    |_env, _ex| Ok(Err(Error::NotConnected)),
+                )
+                .result()?
+                .map_err(Into::<Error>::into)?;
+            u16::try_from(result).map_err(|_| Error::Other("MTU conversion failed".into()))
+        })
+    }
+
     async fn connect(&self) -> Result<()> {
         let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.connect()?))?;
         let result_ref = future.await?;

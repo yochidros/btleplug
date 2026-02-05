@@ -252,6 +252,23 @@ impl api::Peripheral for Peripheral {
         }
     }
 
+    async fn mtu(&self) -> Result<u16> {
+        let fut = CoreBluetoothReplyFuture::default();
+        self.shared
+            .message_sender
+            .to_owned()
+            .send(CoreBluetoothMessage::GetMtu {
+                peripheral_uuid: self.shared.uuid,
+                future: fut.get_state_clone(),
+            })
+            .await?;
+        match fut.await {
+            CoreBluetoothReply::Mtu(mtu) => Ok(mtu),
+            CoreBluetoothReply::Err(msg) => Err(Error::RuntimeError(msg)),
+            reply => panic!("Unexpected reply: {:?}", reply),
+        }
+    }
+
     async fn connect(&self) -> Result<()> {
         let fut = CoreBluetoothReplyFuture::default();
         self.shared

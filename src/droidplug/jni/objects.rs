@@ -24,6 +24,7 @@ pub struct JPeripheral<'a> {
     get_notifications: JMethodID,
     read_descriptor: JMethodID,
     write_descriptor: JMethodID,
+    get_mtu: JMethodID,
     env: JNIEnv<'a>,
 }
 
@@ -67,6 +68,7 @@ impl<'a> JPeripheral<'a> {
             "()Lio/github/gedgygedgy/rust/future/Future;",
         )?;
         let is_connected = env.get_method_id(class, "isConnected", "()Z")?;
+        let get_mtu = env.get_method_id(class, "getMtu", "()I")?;
         let discover_services = env.get_method_id(
             class,
             "discoverServices",
@@ -114,6 +116,7 @@ impl<'a> JPeripheral<'a> {
             get_notifications,
             read_descriptor,
             write_descriptor,
+            get_mtu,
             env: unsafe { env.unsafe_clone() },
         })
     }
@@ -167,6 +170,19 @@ impl<'a> JPeripheral<'a> {
             )
         }?
         .z()
+    }
+
+    pub fn get_mtu(&self) -> Result<jint> {
+        let mut env = unsafe { self.env.unsafe_clone() };
+        unsafe {
+            env.call_method_unchecked(
+                &self.internal,
+                self.get_mtu,
+                ReturnType::Primitive(Primitive::Int),
+                &[],
+            )
+        }?
+        .i()
     }
 
     pub fn discover_services(&self) -> Result<JFuture<'a>> {

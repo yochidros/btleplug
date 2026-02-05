@@ -20,7 +20,7 @@ use windows::{
         BluetoothCacheMode, BluetoothConnectionStatus, BluetoothLEDevice,
         GenericAttributeProfile::{
             GattCharacteristic, GattCommunicationStatus, GattDescriptor, GattDeviceService,
-            GattDeviceServicesResult,
+            GattDeviceServicesResult, GattSession,
         },
     },
     Foundation::TypedEventHandler,
@@ -90,6 +90,22 @@ impl BLEDevice {
         let service_result = self.get_gatt_services(BluetoothCacheMode::Uncached).await?;
         let status = service_result.Status().map_err(|_| Error::DeviceNotFound)?;
         utils::to_error(status)
+    }
+
+    pub async fn mtu(&self) -> Result<u16> {
+        let device_id = self
+            .device
+            .BluetoothDeviceId()
+            .map_err(|e| Error::Other(format!("{:?}", e).into()))?;
+        let session = GattSession::FromDeviceIdAsync(device_id)
+            .map_err(|e| Error::Other(format!("{:?}", e).into()))?
+            .into_future()
+            .await
+            .map_err(|e| Error::Other(format!("{:?}", e).into()))?;
+        let mtu = session
+            .MaxPduSize()
+            .map_err(|e| Error::Other(format!("{:?}", e).into()))?;
+        Ok(mtu)
     }
 
     async fn is_connected(&self) -> Result<bool> {

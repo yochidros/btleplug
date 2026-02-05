@@ -150,6 +150,7 @@ pub enum CoreBluetoothReply {
     ReadResult(Vec<u8>),
     Connected(BTreeSet<Service>),
     State(CBPeripheralState),
+    Mtu(u16),
     Ok,
     Err(String),
 }
@@ -450,6 +451,10 @@ pub enum CoreBluetoothMessage {
         characteristic_uuid: Uuid,
         descriptor_uuid: Uuid,
         data: Vec<u8>,
+        future: CoreBluetoothReplyStateShared,
+    },
+    GetMtu {
+        peripheral_uuid: Uuid,
         future: CoreBluetoothReplyStateShared,
     },
 }
@@ -1205,6 +1210,9 @@ impl CoreBluetoothInternal {
                         data,
                         future,
                     } => self.write_descriptor_value(peripheral_uuid, service_uuid, characteristic_uuid, descriptor_uuid, data, future),
+                    CoreBluetoothMessage::GetMtu { peripheral_uuid, future } => {
+                        self.get_mtu(peripheral_uuid, future);
+                    }
                 };
             }
         }
@@ -1215,6 +1223,26 @@ impl CoreBluetoothInternal {
         fut.lock()
             .unwrap()
             .set_reply(CoreBluetoothReply::AdapterState(state))
+    }
+
+    fn get_mtu(&mut self, peripheral_uuid: Uuid, fut: CoreBluetoothReplyStateShared) {
+        if let Some(peripheral) = self.peripherals.get_mut(&peripheral_uuid) {
+            let max_len = unsafe {
+                peripheral
+                    .peripheral
+                    .maximumWriteValueLengthForType(
+                        CBCharacteristicWriteType::CBCharacteristicWriteWithResponse,
+                    )
+            };
+            let mtu = (max_len as u16).saturating_add(3);
+            fut.lock()
+                .unwrap()
+                .set_reply(CoreBluetoothReply::Mtu(mtu));
+        } else {
+            fut.lock().unwrap().set_reply(CoreBluetoothReply::Err(
+                "Peripheral not found for MTU".to_string(),
+            ));
+        }
     }
 
     fn start_discovery(&mut self, filter: ScanFilter) {

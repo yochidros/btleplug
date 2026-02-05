@@ -362,6 +362,14 @@ impl ApiPeripheral for Peripheral {
         Ok(self.shared.connected.load(Ordering::Relaxed))
     }
 
+    async fn mtu(&self) -> Result<u16> {
+        let device = self.shared.device.lock().await;
+        if let Some(ref device) = *device {
+            return device.mtu().await;
+        }
+        Err(Error::NotConnected)
+    }
+
     /// Creates a connection to the device. This is a synchronous operation; if this method returns
     /// Ok there has been successful connection. Note that peripherals allow only one connection at
     /// a time. Operations that attempt to communicate with a device will fail until it is connected.

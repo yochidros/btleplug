@@ -121,6 +121,13 @@ class Peripheral {
         return this.connected;
     }
 
+    public int getMtu() {
+        if (!this.connected || this.gatt == null) {
+            throw new NotConnectedException();
+        }
+        return this.gatt.getMtu();
+    }
+
     @SuppressLint("MissingPermission")
     public Future<byte[]> read(UUID uuid) {
         SimpleFuture<byte[]> future = new SimpleFuture<>();

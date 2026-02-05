@@ -63,8 +63,10 @@ support.
 | Get Characteristic Notification Event | X       | X           | X     | X       |
 | Read Descriptor                       | X       | X           | X     | X       |
 | Write Descriptor                      | X       | X           | X     | X       |
-| Retrieve MTU                          |         |             |       |         |
+| Retrieve MTU                          | X       | X*          | X     | X       |
 | Retrieve Connection Interval          |         |             |       |         |
+
+* macOS/iOS uses derived MTU (value length + 3).
 
 ## Library Features
 
