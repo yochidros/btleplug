@@ -8,7 +8,7 @@ use crate::{
 use async_trait::async_trait;
 use futures::stream::Stream;
 use jni::{
-    objects::{GlobalRef, JList, JObject},
+    objects::{GlobalRef, JByteArray, JList, JObject, JString},
     JNIEnv,
 };
 use jni_utils::{
@@ -45,26 +45,23 @@ impl Display for PeripheralId {
     }
 }
 
-fn get_poll_result<'a: 'b, 'b>(
-    env: &'b JNIEnv<'a>,
-    result: JPollResult<'a, 'b>,
-) -> Result<JObject<'a>> {
-    try_block(env, || Ok(Ok(result.get()?)))
+fn get_poll_result<'a>(env: &mut JNIEnv<'a>, result: JPollResult<'a>) -> Result<JObject<'a>> {
+    try_block(env, |_env| Ok(Ok(result.get()?)))
         .catch(
-            JClass::from(
+            <&JClass>::from(
                 jni_utils::classcache::get_class(
                     "io/github/gedgygedgy/rust/future/FutureException",
                 )
                 .unwrap()
                 .as_obj(),
             ),
-            |ex| {
+            |env, ex| {
                 let cause = env
-                    .call_method(ex, "getCause", "()Ljava/lang/Throwable;", &[])?
+                    .call_method(&ex, "getCause", "()Ljava/lang/Throwable;", &[])?
                     .l()?;
                 if env.is_instance_of(
-                    cause,
-                    JClass::from(
+                    &cause,
+                    <&JClass>::from(
                         jni_utils::classcache::get_class(
                             "com/nonpolynomial/btleplug/android/impl/NotConnectedException",
                         )
@@ -74,8 +71,8 @@ fn get_poll_result<'a: 'b, 'b>(
                 )? {
                     Ok(Err(Error::NotConnected))
                 } else if env.is_instance_of(
-                    cause,
-                    JClass::from(
+                    &cause,
+                    <&JClass>::from(
                         jni_utils::classcache::get_class(
                             "com/nonpolynomial/btleplug/android/impl/PermissionDeniedException",
                         )
@@ -85,8 +82,8 @@ fn get_poll_result<'a: 'b, 'b>(
                 )? {
                     Ok(Err(Error::PermissionDenied))
                 } else if env.is_instance_of(
-                    cause,
-                    JClass::from(
+                    &cause,
+                    <&JClass>::from(
                         jni_utils::classcache::get_class(
                             "com/nonpolynomial/btleplug/android/impl/UnexpectedCallbackException",
                         )
@@ -96,8 +93,8 @@ fn get_poll_result<'a: 'b, 'b>(
                 )? {
                     Ok(Err(Error::UnexpectedCallback))
                 } else if env.is_instance_of(
-                    cause,
-                    JClass::from(
+                    &cause,
+                    <&JClass>::from(
                         jni_utils::classcache::get_class(
                             "com/nonpolynomial/btleplug/android/impl/UnexpectedCharacteristicException",
                         )
@@ -107,8 +104,8 @@ fn get_poll_result<'a: 'b, 'b>(
                 )? {
                     Ok(Err(Error::UnexpectedCharacteristic))
                 } else if env.is_instance_of(
-                    cause,
-                    JClass::from(
+                    &cause,
+                    <&JClass>::from(
                         jni_utils::classcache::get_class(
                             "com/nonpolynomial/btleplug/android/impl/NoSuchCharacteristicException",
                         )
@@ -118,15 +115,16 @@ fn get_poll_result<'a: 'b, 'b>(
                 )? {
                     Ok(Err(Error::NoSuchCharacteristic))
                 } else if env.is_instance_of(
-                    cause,
+                    &cause,
                     "java/lang/RuntimeException",
                 )? {
                     let msg = env
-                        .call_method(cause, "getMessage", "()Ljava/lang/String;", &[])
+                        .call_method(&cause, "getMessage", "()Ljava/lang/String;", &[])
                         .unwrap()
                         .l()
                         .unwrap();
-                    let msgstr:String = env.get_string(msg.into()).unwrap().into();
+                    let msg: JString = msg.into();
+                    let msgstr: String = env.get_string(&msg).unwrap().into();
                     Ok(Err(Error::RuntimeError(msgstr)))
                 } else {
                     env.throw(ex)?;
@@ -152,11 +150,16 @@ pub struct Peripheral {
 }
 
 impl Peripheral {
-    pub(crate) fn new(env: &JNIEnv, adapter: JObject, addr: BDAddr) -> Result<Self> {
+    pub(crate) fn new<'a>(
+        env: &mut JNIEnv<'a>,
+        adapter: JObject<'a>,
+        addr: BDAddr,
+    ) -> Result<Self> {
         let obj = JPeripheral::new(env, adapter, addr)?;
+        let obj_ref: JObject = obj.into();
         Ok(Self {
             addr,
-            internal: env.new_global_ref(obj)?,
+            internal: env.new_global_ref(&obj_ref)?,
             shared: Arc::new(Mutex::new(PeripheralShared {
                 services: BTreeSet::new(),
                 characteristics: BTreeSet::new(),
@@ -173,14 +176,15 @@ impl Peripheral {
 
     fn with_obj<T, E>(
         &self,
-        f: impl FnOnce(&JNIEnv, JPeripheral) -> std::result::Result<T, E>,
+        f: impl for<'a> FnOnce(&mut JNIEnv<'a>, JPeripheral<'a>) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E>
     where
         E: From<::jni::errors::Error>,
     {
-        let env = global_jvm().get_env()?;
-        let obj = JPeripheral::from_env(&env, self.internal.as_obj())?;
-        f(&env, obj)
+        let mut env = global_jvm().get_env()?;
+        let obj = env.new_local_ref(self.internal.as_obj())?;
+        let obj = JPeripheral::from_env(&mut env, obj)?;
+        f(&mut env, obj)
     }
 
     async fn set_characteristic_notification(
@@ -194,7 +198,7 @@ impl Peripheral {
         })?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
-            let result = JPollResult::from_env(env, result_ref.as_obj())?;
+            let result = JPollResult::from_env(env, env.new_local_ref(result_ref.as_obj())?)?;
             get_poll_result(env, result).map(|_| {})
         })
     }
@@ -231,11 +235,30 @@ impl api::Peripheral for Peripheral {
         self.with_obj(|_env, obj| Ok(obj.is_connected()?))
     }
 
+    async fn mtu(&self, _characteristics: Option<&[Characteristic]>) -> Result<u16> {
+        self.with_obj(|env, obj| {
+            let result = try_block(env, |_env| Ok(Ok(obj.get_mtu()?)))
+                .catch(
+                    <&JClass>::from(
+                        jni_utils::classcache::get_class(
+                            "com/nonpolynomial/btleplug/android/impl/NotConnectedException",
+                        )
+                        .unwrap()
+                        .as_obj(),
+                    ),
+                    |_env, _ex| Ok(Err(Error::NotConnected)),
+                )
+                .result()?
+                .map_err(Into::<Error>::into)?;
+            u16::try_from(result).map_err(|_| Error::Other("MTU conversion failed".into()))
+        })
+    }
+
     async fn connect(&self) -> Result<()> {
         let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.connect()?))?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
-            let result = JPollResult::from_env(env, result_ref.as_obj())?;
+            let result = JPollResult::from_env(env, env.new_local_ref(result_ref.as_obj())?)?;
             get_poll_result(env, result).map(|_| {})
         })
     }
@@ -244,7 +267,7 @@ impl api::Peripheral for Peripheral {
         let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.disconnect()?))?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
-            let result = JPollResult::from_env(env, result_ref.as_obj())?;
+            let result = JPollResult::from_env(env, env.new_local_ref(result_ref.as_obj())?)?;
             get_poll_result(env, result).map(|_| {})
         })
     }
@@ -262,13 +285,14 @@ impl api::Peripheral for Peripheral {
         self.with_obj(|env, _obj| {
             use std::iter::FromIterator;
 
-            let result = JPollResult::from_env(env, result_ref.as_obj())?;
+            let result = JPollResult::from_env(env, env.new_local_ref(result_ref.as_obj())?)?;
             let obj = get_poll_result(env, result)?;
-            let list = JList::from_env(env, obj)?;
+            let list = JList::from_env(env, &obj)?;
             let mut peripheral_services = Vec::new();
             let mut peripheral_characteristics = Vec::new();
 
-            for service in list.iter()? {
+            let mut iter = list.iter(env)?;
+            while let Some(service) = iter.next(env)? {
                 let service = JBluetoothGattService::from_env(env, service)?;
                 let mut characteristics = BTreeSet::<Characteristic>::new();
                 for characteristic in service.get_characteristics()? {
@@ -318,8 +342,9 @@ impl api::Peripheral for Peripheral {
         write_type: WriteType,
     ) -> Result<()> {
         let future = self.with_obj(|env, obj| {
-            let uuid = JUuid::new(env, characteristic.uuid)?;
-            let data_obj = jni_utils::arrays::slice_to_byte_array(env, data)?;
+            let mut local_env = unsafe { env.unsafe_clone() };
+            let uuid = JUuid::new(&mut local_env, characteristic.uuid)?;
+            let data_obj = jni_utils::arrays::slice_to_byte_array(&mut local_env, data)?;
             let write_type = match write_type {
                 WriteType::WithResponse => 2,
                 WriteType::WithoutResponse => 1,
@@ -328,7 +353,7 @@ impl api::Peripheral for Peripheral {
         })?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
-            let result = JPollResult::from_env(env, result_ref.as_obj())?;
+            let result = JPollResult::from_env(env, env.new_local_ref(result_ref.as_obj())?)?;
             get_poll_result(env, result).map(|_| {})
         })
     }
@@ -340,9 +365,10 @@ impl api::Peripheral for Peripheral {
         })?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
-            let result = JPollResult::from_env(env, result_ref.as_obj())?;
+            let result = JPollResult::from_env(env, env.new_local_ref(result_ref.as_obj())?)?;
             let bytes = get_poll_result(env, result)?;
-            Ok(byte_array_to_vec(env, bytes.into_inner())?)
+            let mut local_env = unsafe { env.unsafe_clone() };
+            Ok(byte_array_to_vec(&mut local_env, JByteArray::from(bytes))?)
         })
     }
 
@@ -362,9 +388,9 @@ impl api::Peripheral for Peripheral {
         let stream = stream
             .map(|item| match item {
                 Ok(item) => {
-                    let env = global_jvm().get_env()?;
-                    let item = item.as_obj();
-                    let characteristic = JBluetoothGattCharacteristic::from_env(&env, item)?;
+                    let mut env = global_jvm().get_env()?;
+                    let item = env.new_local_ref(item.as_obj())?;
+                    let characteristic = JBluetoothGattCharacteristic::from_env(&mut env, item)?;
                     let uuid = characteristic.get_uuid()?;
                     let value = characteristic.get_value()?;
                     Ok(ValueNotification { uuid, value })
@@ -377,14 +403,15 @@ impl api::Peripheral for Peripheral {
 
     async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
         let future = self.with_obj(|env, obj| {
-            let characteristic = JUuid::new(env, descriptor.characteristic_uuid)?;
-            let uuid = JUuid::new(env, descriptor.uuid)?;
-            let data_obj = jni_utils::arrays::slice_to_byte_array(env, data)?;
+            let mut local_env = unsafe { env.unsafe_clone() };
+            let characteristic = JUuid::new(&mut local_env, descriptor.characteristic_uuid)?;
+            let uuid = JUuid::new(&mut local_env, descriptor.uuid)?;
+            let data_obj = jni_utils::arrays::slice_to_byte_array(&mut local_env, data)?;
             JSendFuture::try_from(obj.write_descriptor(characteristic, uuid, data_obj.into())?)
         })?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
-            let result = JPollResult::from_env(env, result_ref.as_obj())?;
+            let result = JPollResult::from_env(env, env.new_local_ref(result_ref.as_obj())?)?;
             get_poll_result(env, result).map(|_| {})
         })
     }
@@ -397,9 +424,10 @@ impl api::Peripheral for Peripheral {
         })?;
         let result_ref = future.await?;
         self.with_obj(|env, _obj| {
-            let result = JPollResult::from_env(env, result_ref.as_obj())?;
+            let result = JPollResult::from_env(env, env.new_local_ref(result_ref.as_obj())?)?;
             let bytes = get_poll_result(env, result)?;
-            Ok(byte_array_to_vec(env, bytes.into_inner())?)
+            let mut local_env = unsafe { env.unsafe_clone() };
+            Ok(byte_array_to_vec(&mut local_env, JByteArray::from(bytes))?)
         })
     }
 }

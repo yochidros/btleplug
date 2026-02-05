@@ -167,6 +167,22 @@ impl api::Peripheral for Peripheral {
         Ok(device_info.connected)
     }
 
+    async fn mtu(&self, _characteristics: Option<&[Characteristic]>) -> Result<u16> {
+        if self.services.lock().map_err(Into::<Error>::into)?.is_empty() {
+            self.discover_services().await?;
+        }
+        let services = self.services.lock().map_err(Into::<Error>::into)?;
+        let mut max_mtu = None;
+        for service in services.values() {
+            for characteristic in service.characteristics.values() {
+                if let Some(mtu) = characteristic.info.mtu {
+                    max_mtu = Some(max_mtu.map_or(mtu, |current| current.max(mtu)));
+                }
+            }
+        }
+        max_mtu.ok_or_else(|| Error::NotSupported("MTU not available".to_string()))
+    }
+
     async fn connect(&self) -> Result<()> {
         self.session.connect(&self.device).await?;
         Ok(())
