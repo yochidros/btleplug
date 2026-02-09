@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothGattCallback;
 import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
+import android.util.Log;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
@@ -23,13 +24,18 @@ import io.github.gedgygedgy.rust.stream.Stream;
 
 @SuppressWarnings("unused") // Native code uses this class.
 class Peripheral {
+    private static final String TAG = "btleplug-Peripheral";
     private static final UUID CLIENT_CHARACTERISTIC_CONFIGURATION_DESCRIPTOR = new UUID(0x00002902_0000_1000L, 0x8000_00805f9b34fbL);
+    private static final int DEFAULT_MTU = 23;
+    private static final int REQUESTED_MTU = 517;
 
     private final BluetoothDevice device;
     private final Adapter adapter;
     private BluetoothGatt gatt;
     private final Callback callback;
     private boolean connected = false;
+    private int negotiatedMtu = DEFAULT_MTU;
+    private boolean mtuRequestPending = false;
 
     private final Queue<Runnable> commandQueue = new LinkedList<>();
     private final LinkedList<WeakReference<QueueStream<BluetoothGattCharacteristic>>> notificationStreams = new LinkedList<>();
@@ -52,7 +58,9 @@ class Peripheral {
                         @Override
                         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
                             Peripheral.this.asyncWithFuture(future, () -> {
+                                Log.d(TAG, "connect callback: status=" + status + " newState=" + newState);
                                 if (status != BluetoothGatt.GATT_SUCCESS) {
+                                    Log.w(TAG, "connect failed: status=" + status);
                                     throw new NotConnectedException();
                                 }
 
@@ -67,12 +75,14 @@ class Peripheral {
                         Peripheral.this.wakeCommand(future, null);
                     } else if (this.gatt == null) {
                         try {
+                            this.negotiatedMtu = DEFAULT_MTU;
                             this.setCommandCallback(callback);
                             this.gatt = this.device.connectGatt(null, false, this.callback);
                         } catch (SecurityException ex) {
                             throw new PermissionDeniedException(ex);
                         }
                     } else {
+                        this.negotiatedMtu = DEFAULT_MTU;
                         this.setCommandCallback(callback);
                         if (!this.gatt.connect()) {
                             throw new RuntimeException("Unable to reconnect to device");
@@ -125,7 +135,17 @@ class Peripheral {
         if (!this.connected || this.gatt == null) {
             throw new NotConnectedException();
         }
-        return this.gatt.getMtu();
+        return this.negotiatedMtu - 3;
+    }
+
+    private boolean requestMtu(BluetoothGatt gatt) {
+        try {
+            Object started = BluetoothGatt.class.getMethod("requestMtu", int.class).invoke(gatt, REQUESTED_MTU);
+            return !(started instanceof Boolean) || (Boolean) started;
+        } catch (ReflectiveOperationException ex) {
+            // requestMtu is not supported on this API level.
+            return false;
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -178,12 +198,12 @@ class Peripheral {
     public Future<Void> write(UUID uuid, byte[] data, int writeType) {
         SimpleFuture<Void> future = new SimpleFuture<>();
         synchronized (this) {
+            if (!this.connected) {
+                future.wakeWithThrowable(new NotConnectedException());
+                return future;
+            }
             this.queueCommand(() -> {
                 this.asyncWithFuture(future, () -> {
-                    if (!this.connected) {
-                        throw new NotConnectedException();
-                    }
-
                     BluetoothGattCharacteristic characteristic = this.getCharacteristicByUuid(uuid);
                     characteristic.setValue(data);
                     characteristic.setWriteType(writeType);
@@ -233,6 +253,18 @@ class Peripheral {
                     }
 
                     this.setCommandCallback(new CommandCallback() {
+                        private boolean startedDiscovery = false;
+
+                        private void startDiscoverServices(BluetoothGatt gatt) {
+                            if (startedDiscovery) {
+                                return;
+                            }
+                            startedDiscovery = true;
+                            if (!gatt.discoverServices()) {
+                                throw new RuntimeException("Unable to discover services");
+                            }
+                        }
+
                         @Override
                         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
                             if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -255,8 +287,20 @@ class Peripheral {
                                 }
                             });
                         }
+
+                        @Override
+                        public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+                            Peripheral.this.asyncWithFuture(future, () -> {
+                                if (status != BluetoothGatt.GATT_SUCCESS) {
+                                    throw new RuntimeException("Unable to negotiate mtu before discovering services");
+                                }
+                                startDiscoverServices(gatt);
+                            });
+                        }
                     });
-                    if (!this.gatt.discoverServices()) {
+                    if (this.mtuRequestPending) {
+                        Log.d(TAG, "discoverServices waits for MTU negotiation");
+                    } else if (!this.gatt.discoverServices()) {
                         throw new RuntimeException("Unable to discover services");
                     }
                 });
@@ -471,6 +515,7 @@ class Peripheral {
     private class Callback extends BluetoothGattCallback {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+            Log.d(TAG, "gatt callback: onConnectionStateChange status=" + status + " newState=" + newState);
             synchronized (Peripheral.this) {
                 switch (newState) {
                     case BluetoothGatt.STATE_CONNECTED:
@@ -478,6 +523,8 @@ class Peripheral {
                         break;
                     case BluetoothGatt.STATE_DISCONNECTED:
                         Peripheral.this.connected = false;
+                        Peripheral.this.negotiatedMtu = DEFAULT_MTU;
+                        Peripheral.this.mtuRequestPending = false;
                         break;
                 }
                 if (Peripheral.this.commandCallback != null) {
@@ -487,6 +534,12 @@ class Peripheral {
             switch (newState) {
                 case BluetoothGatt.STATE_CONNECTED:
                     Peripheral.this.adapter.onConnectionStateChanged(Peripheral.this.device.getAddress(), true);
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        synchronized (Peripheral.this) {
+                            Peripheral.this.mtuRequestPending = Peripheral.this.requestMtu(gatt);
+                            Log.d(TAG, "requestMtu started=" + Peripheral.this.mtuRequestPending + " requested=" + REQUESTED_MTU);
+                        }
+                    }
                     break;
                 case BluetoothGatt.STATE_DISCONNECTED:
                     Peripheral.this.adapter.onConnectionStateChanged(Peripheral.this.device.getAddress(), false);
@@ -499,6 +552,20 @@ class Peripheral {
             synchronized (Peripheral.this) {
                 if (Peripheral.this.commandCallback != null) {
                     Peripheral.this.commandCallback.onCharacteristicRead(gatt, characteristic, status);
+                }
+            }
+        }
+
+        @Override
+        public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+            Log.d(TAG, "gatt callback: onMtuChanged mtu=" + mtu + " status=" + status);
+            synchronized (Peripheral.this) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Peripheral.this.negotiatedMtu = mtu;
+                }
+                Peripheral.this.mtuRequestPending = false;
+                if (Peripheral.this.commandCallback != null) {
+                    Peripheral.this.commandCallback.onMtuChanged(gatt, mtu, status);
                 }
             }
         }
