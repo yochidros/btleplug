@@ -172,7 +172,7 @@ impl api::Peripheral for Peripheral {
             self.discover_services().await?;
         }
         let services = self.services.lock().map_err(Into::<Error>::into)?;
-        let mut max_mtu = None;
+        let mut max_mtu: Option<u16> = None;
         for service in services.values() {
             for characteristic in service.characteristics.values() {
                 if let Some(mtu) = characteristic.info.mtu {
