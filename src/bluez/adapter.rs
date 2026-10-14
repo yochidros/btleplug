@@ -1,5 +1,7 @@
 use super::peripheral::{Peripheral, PeripheralId};
-use crate::api::{Central, CentralEvent, CentralState, ScanFilter};
+use crate::api::{
+    self, BDAddr, Central, CentralEvent, CentralState, RetrievePeripheralsOptions, ScanFilter,
+};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use bluez_async::{
@@ -29,6 +31,22 @@ fn get_central_state(powered: bool) -> CentralState {
     }
 }
 
+fn matches_retrieval_options(
+    candidate_id: &bluez_async::DeviceId,
+    candidate_services: &[uuid::Uuid],
+    connected: bool,
+    options: &RetrievePeripheralsOptions,
+) -> bool {
+    let candidate_id = PeripheralId(candidate_id.clone());
+    let service_match = connected && options.services.is_some();
+    let services = if service_match {
+        candidate_services
+    } else {
+        &[]
+    };
+    api::matches_retrieval_selectors(&candidate_id, services, options)
+}
+
 #[async_trait]
 impl Central for Adapter {
     type Peripheral = Peripheral;
@@ -47,9 +65,16 @@ impl Central for Adapter {
                 .into_iter()
                 .filter(move |device| device.id.adapter() == adapter_id)
                 .flat_map(|device| {
-                    let mut events = vec![CentralEvent::DeviceDiscovered(device.id.clone().into())];
+                    let peripheral_id: PeripheralId = device.id.into();
+                    let mut events = vec![CentralEvent::DeviceDiscovered(peripheral_id.clone())];
+                    if !device.services.is_empty() {
+                        events.push(CentralEvent::ServicesAdvertisement {
+                            id: peripheral_id.clone(),
+                            services: device.services,
+                        });
+                    }
                     if device.connected {
-                        events.push(CentralEvent::DeviceConnected(device.id.into()));
+                        events.push(CentralEvent::DeviceConnected(peripheral_id));
                     }
                     events.into_iter()
                 }),
@@ -58,7 +83,8 @@ impl Central for Adapter {
         let session = self.session.clone();
         let adapter_id = self.adapter.clone();
         let events = events
-            .filter_map(move |event| central_event(event, session.clone(), adapter_id.clone()));
+            .filter_map(move |event| central_events(event, session.clone(), adapter_id.clone()))
+            .flat_map(stream::iter);
 
         Ok(Box::pin(initial_events.chain(events)))
     }
@@ -91,6 +117,22 @@ impl Central for Adapter {
             .collect())
     }
 
+    async fn retrieve_peripherals(
+        &self,
+        options: RetrievePeripheralsOptions,
+    ) -> Result<Vec<Peripheral>> {
+        let devices = self.session.get_devices_on_adapter(&self.adapter).await?;
+        let devices = devices.into_iter().filter(|device| {
+            matches_retrieval_options(&device.id, &device.services, device.connected, &options)
+        });
+        let devices = api::merge_retrieved_peripherals(devices, |device| device.id.clone());
+
+        Ok(devices
+            .into_iter()
+            .map(|device| Peripheral::new(self.session.clone(), device))
+            .collect())
+    }
+
     async fn peripheral(&self, id: &PeripheralId) -> Result<Peripheral> {
         let device = self.session.get_device_info(&id.0).await.map_err(|e| {
             if let BluetoothError::DbusError(_) = e {
@@ -108,9 +150,24 @@ impl Central for Adapter {
         ))
     }
 
+    async fn clear_peripherals(&self) -> Result<()> {
+        // BlueZ queries the daemon live; peripherals aren't cached locally.
+        Ok(())
+    }
+
     async fn adapter_info(&self) -> Result<String> {
         let adapter_info = self.session.get_adapter_info(&self.adapter).await?;
         Ok(format!("{} ({})", adapter_info.id, adapter_info.modalias))
+    }
+
+    async fn adapter_address(&self) -> Result<Option<BDAddr>> {
+        let address: BDAddr = self
+            .session
+            .get_adapter_info(&self.adapter)
+            .await?
+            .mac_address
+            .into();
+        Ok((address != BDAddr::default()).then_some(address))
     }
 
     async fn adapter_state(&self) -> Result<CentralState> {
@@ -128,11 +185,11 @@ impl From<BluetoothError> for Error {
     }
 }
 
-async fn central_event(
+async fn central_events(
     event: BluetoothEvent,
     session: BluetoothSession,
     adapter_id: AdapterId,
-) -> Option<CentralEvent> {
+) -> Option<Vec<CentralEvent>> {
     match event {
         BluetoothEvent::Device {
             id,
@@ -140,53 +197,64 @@ async fn central_event(
         } if id.adapter() == adapter_id => match device_event {
             DeviceEvent::Discovered => {
                 let device = session.get_device_info(&id).await.ok()?;
-                Some(CentralEvent::DeviceDiscovered(device.id.into()))
+                let peripheral_id: PeripheralId = device.id.into();
+                let mut events = vec![CentralEvent::DeviceDiscovered(peripheral_id.clone())];
+                // BlueZ may already know the device's services (from cache or the
+                // advertisement).  Emit a ServicesAdvertisement so listeners don't
+                // have to wait for a separate PropertiesChanged signal that may
+                // never arrive for cached devices.
+                if !device.services.is_empty() {
+                    events.push(CentralEvent::ServicesAdvertisement {
+                        id: peripheral_id,
+                        services: device.services,
+                    });
+                }
+                Some(events)
             }
             DeviceEvent::Connected { connected } => {
-                let device = session.get_device_info(&id).await.ok()?;
                 if connected {
-                    Some(CentralEvent::DeviceConnected(device.id.into()))
+                    Some(vec![CentralEvent::DeviceConnected(id.into())])
                 } else {
-                    Some(CentralEvent::DeviceDisconnected(device.id.into()))
+                    Some(vec![CentralEvent::DeviceDisconnected(id.into())])
                 }
             }
-            DeviceEvent::Rssi { rssi: _ } => {
+            DeviceEvent::Rssi { rssi } => {
                 let device = session.get_device_info(&id).await.ok()?;
-                Some(CentralEvent::DeviceUpdated(device.id.into()))
+                Some(vec![CentralEvent::RssiUpdate {
+                    id: device.id.into(),
+                    rssi,
+                }])
             }
             DeviceEvent::ManufacturerData { manufacturer_data } => {
                 let device = session.get_device_info(&id).await.ok()?;
-                Some(CentralEvent::ManufacturerDataAdvertisement {
+                Some(vec![CentralEvent::ManufacturerDataAdvertisement {
                     id: device.id.into(),
                     manufacturer_data,
-                })
+                }])
             }
             DeviceEvent::ServiceData { service_data } => {
                 let device = session.get_device_info(&id).await.ok()?;
-                Some(CentralEvent::ServiceDataAdvertisement {
+                Some(vec![CentralEvent::ServiceDataAdvertisement {
                     id: device.id.into(),
                     service_data,
-                })
+                }])
             }
             DeviceEvent::Services { services } => {
                 let device = session.get_device_info(&id).await.ok()?;
-                Some(CentralEvent::ServicesAdvertisement {
+                Some(vec![CentralEvent::ServicesAdvertisement {
                     id: device.id.into(),
                     services,
-                })
+                }])
             }
             _ => None,
         },
         BluetoothEvent::Adapter {
             id,
-            event: adapter_event,
-        } if id == adapter_id => match adapter_event {
-            AdapterEvent::Powered { powered } => {
-                let state = get_central_state(powered);
-                Some(CentralEvent::StateUpdate(state))
-            }
-            _ => None,
-        },
+            event: AdapterEvent::Powered { powered },
+        } if id == adapter_id => {
+            let state = get_central_state(powered);
+            Some(vec![CentralEvent::StateUpdate(state)])
+        }
         _ => None,
     }
 }

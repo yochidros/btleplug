@@ -25,7 +25,7 @@ support.
 
 ## Platform Status
 
-- **Linux / Windows / macOS / iOS / Android**
+- **Linux / Windows / macOS (>= 10.15) / iOS / Android**
   - Device enumeration and characteristic/services implemented and working.
   - Please file bugs and missing features if you find them.
 - **WASM/WebBluetooth**
@@ -52,6 +52,7 @@ support.
 | └ Discover Manufacturer Data          | X       | X           | X     | X       |
 | └ Discover Service Data               | X       | X           | X     | X       |
 | └ Discover MAC address                | X       |             | X     | X       |
+| Retrieve local adapter address         | X       |             | X     |         |
 | GATT Server Connect                   | X       | X           | X     | X       |
 | GATT Server Connect Event             | X       | X           | X     | X       |
 | GATT Server Disconnect                | X       | X           | X     | X       |
@@ -63,10 +64,27 @@ support.
 | Get Characteristic Notification Event | X       | X           | X     | X       |
 | Read Descriptor                       | X       | X           | X     | X       |
 | Write Descriptor                      | X       | X           | X     | X       |
-| Retrieve MTU                          | X       | X*          | X     | X       |
-| Retrieve Connection Interval          |         |             |       |         |
+| Retrieve MTU                          | X       | X           | X     | X       |
+| Retrieve Connection Parameters        | X       |             |       | X       |
+| Read RSSI                             | X       | X           | X     | X       |
+| Retrieve Adapter State                | X       | X           | X     |         |
+| Request Connection Parameters         | X       |             |       | X       |
+| Add Peripheral by Address             |         |             |       | X       |
 
-* macOS/iOS uses derived MTU (value length + 3).
+### Platform Caveats
+
+#### Scan Filtering on Linux (BlueZ)
+
+The `Central::adapter_address()` API retrieves a local Bluetooth adapter address only where the platform exposes one (currently Linux and Windows). CoreBluetooth and ordinary Android applications return `Ok(None)` because their public APIs provide opaque or privacy-restricted adapter identities. This address is distinct from a discovered peripheral address; `PeripheralId` remains the portable identity for adapters' peripherals.
+
+The `ScanFilter` passed to `start_scan()` behaves differently on Linux than
+other platforms. btleplug forwards service UUID filters to BlueZ, but BlueZ
+[merges discovery filters across all D-Bus clients](https://github.com/bluez/bluez/blob/290f9973c9069f293367284e95fd338a221ab90d/doc/org.bluez.Adapter.rst?plain=1#L171-L173).
+Your application will receive advertisements matching the **union** of all
+applications' filters, not just your own. Additionally, BlueZ's UUID filter can
+drop some advertisement types (such as service data) that it shouldn't.
+Applications targeting Linux should perform their own post-filtering on scan
+results rather than relying solely on `ScanFilter`.
 
 ## Library Features
 
@@ -76,7 +94,7 @@ To enable implementation of serde's `Serialize` and `Deserialize` across some co
 
 ```toml
 [dependencies]
-btleplug = { version = "0.11", features = ["serde"] }
+btleplug = { version = "0.12", features = ["serde"] }
 ```
 
 ## Build/Installation Notes for Specific Platforms
@@ -96,50 +114,34 @@ Privacy_ → _Privacy_ → _Bluetooth_, clicking the '+' button, and selecting
 Due to requiring a hybrid Rust/Java build, btleplug for Android requires a somewhat complicated
 setup.
 
-Some information on performing the build is available in the [original issue for Android support in btlplug](https://github.com/deviceplug/btleplug/issues/8). 
+The Android library and its test application require Android API 24 (Android 7.0) or newer. This is
+because the JNI support classes use Java functional interfaces introduced in API 24. Applications
+that need to support API 23 must use a compatible btleplug release or provide a redesigned JNI
+interface; core library desugaring is not enabled by btleplug and would also need to be configured
+by the consuming application.
 
-A quick overview of the build process:
+There is now a build script at `./scripts/build-java.sh` for building the java portion of the library on linux or macOS. This can also be used as a guide for manual building if need be.
 
-- For java, you will need the java portion of
-  [jni-utils-rs](https://github.com/deviceplug/jni-utils-rs) available either in a Maven repository
-  or locally (if locally, you'll need to check out btleplug and change the gradle file).
-- Either build the java portion of btleplug, in the `src/droidplug/java` directory, using the
-  included gradle files, and them to a Maven repo, or have the Java portion of your android app point to that as a local implementation.
-- For Rust, the build should go as normal, though we recommend using `cargo-ndk` to build. Output
-  the jniLibs and make sure they end up in the right place in your app.
+Call `btleplug::platform::init` from a thread whose context class loader sees the application's classes. Threads that entered native code from Java already do. A thread attached from native code must first set its context class loader to the application's, such as `Context.getClassLoader()`.
 
-Proguard optimization can be an issue when using btleplug, as the .aar file generated by the java
-code in btleplug is only accessed by native code, and can be optimized out as part of dead code
-removal and resource shrinking. To fix this, changes will need to be made to your build.gradle file, and proguard rules will need to be defined.
+If your app uses Proguard/R8 with `minifyEnabled true`, you must add keep rules for btleplug's
+Java classes. All of btleplug's Java code (including vendored jni-utils classes) is only accessed
+via JNI from native code, so R8 will treat it as dead code and strip it without these rules.
 
-For build.gradle:
+In your `build.gradle`, ensure Proguard is configured for release builds:
 ```groovy
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig signingConfigs.debug
-
             shrinkResources true
             minifyEnabled true
-
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-
         }
     }
 ```
 
 proguard-rules.pro:
 ```
-#Flutter Wrapper - Only needed if using flutter
--keep class io.flutter.app.** { *; }
--keep class io.flutter.plugin.**  { *; }
--keep class io.flutter.util.**  { *; }
--keep class io.flutter.view.**  { *; }
--keep class io.flutter.**  { *; }
--keep class io.flutter.plugins.**  { *; }
-
-#btleplug resources
+# btleplug Java classes (accessed only via JNI)
 -keep class com.nonpolynomial.** { *; }
 -keep class io.github.gedgygedgy.** { *; }
 ```
@@ -182,6 +184,25 @@ Everyone has different bluetooth needs, so if btleplug doesn't fit yours, try th
   features since it only supports one platform (we use
   [Bluez-async](https://crates.io/crates/bluez-async) internally.)
   
+## Integration Tests
+
+btleplug includes integration tests that exercise real BLE operations against a test peripheral.
+
+**Quick start with hardware:**
+
+See `test-peripheral/README.md` for the one-time pinned-workspace setup (`uv`, `west`, the Zephyr SDK). Once that's done:
+
+```bash
+# Flash the nRF52840 DK (.venv activated)
+cd test-peripheral/zephyr
+west build -b nrf52840dk/nrf52840 --pristine && west flash --runner nrfjprog
+
+# Run integration tests
+cargo test --test '*' -- --ignored
+```
+
+See `test-peripheral/README.md` for full setup instructions.
+
 ## License
 
 BTLEPlug is covered under a BSD 3-Clause License, with some parts from

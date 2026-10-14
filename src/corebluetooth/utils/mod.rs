@@ -28,8 +28,10 @@ pub fn nsuuid_to_uuid(uuid: &NSUUID) -> Uuid {
 }
 
 pub unsafe fn nsstring_to_string(nsstring: *const NSString) -> Option<String> {
-    nsstring
-        .as_ref()
-        .and_then(|ns| CStr::from_ptr(ns.UTF8String()).to_str().ok())
-        .map(String::from)
+    unsafe {
+        nsstring
+            .as_ref()
+            .and_then(|ns| CStr::from_ptr(ns.UTF8String()).to_str().ok())
+            .map(String::from)
+    }
 }

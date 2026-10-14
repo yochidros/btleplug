@@ -2,14 +2,14 @@
 // Big Sur or later.
 
 use btleplug::api::{
-    bleuuid::BleUuid, Central, CentralEvent, Manager as _, Peripheral, ScanFilter,
+    Central, CentralEvent, Manager as _, Peripheral, ScanFilter, bleuuid::BleUuid,
 };
 use btleplug::platform::{Adapter, Manager};
 use futures::stream::StreamExt;
 
 async fn get_central(manager: &Manager) -> Adapter {
     let adapters = manager.adapters().await.unwrap();
-    adapters.into_iter().nth(0).unwrap()
+    adapters.into_iter().next().unwrap()
 }
 
 #[tokio::main]
@@ -33,9 +33,8 @@ async fn main() -> anyhow::Result<()> {
     // start scanning for devices
     central.start_scan(ScanFilter::default()).await?;
 
-    // Print based on whatever the event receiver outputs. Note that the event
-    // receiver blocks, so in a real program, this should be run in its own
-    // thread (not task, as this library does not yet use async channels).
+    // Process events asynchronously. In a real program, run this loop in its own
+    // Tokio task if event handling should proceed independently of other work.
     while let Some(event) = events.next().await {
         match event {
             CentralEvent::DeviceDiscovered(id) => {

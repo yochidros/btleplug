@@ -9,12 +9,12 @@ use super::internal::{
     CoreBluetoothMessage, CoreBluetoothReply, CoreBluetoothReplyFuture, PeripheralEventInternal,
 };
 use crate::{
+    Error, Result,
     api::{
         self, BDAddr, CentralEvent, CharPropFlags, Characteristic, Descriptor,
         PeripheralProperties, Service, ValueNotification, WriteType,
     },
     common::{adapter_manager::AdapterManager, util::notifications_stream_from_broadcast_receiver},
-    Error, Result,
 };
 use async_trait::async_trait;
 use futures::channel::mpsc::{Receiver, SendError, Sender};
@@ -31,7 +31,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fmt::{self, Debug, Display, Formatter},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicU16},
 };
 use tokio::sync::broadcast;
 use tokio::task;
@@ -64,6 +64,7 @@ struct Shared {
     services: Mutex<BTreeSet<Service>>,
     properties: Mutex<PeripheralProperties>,
     message_sender: Sender<CoreBluetoothMessage>,
+    mtu: AtomicU16,
     // We're not actually holding a peripheral object here, that's held out in
     // the objc thread. We'll just communicate with it through our
     // receiver/sender pair.
@@ -71,10 +72,13 @@ struct Shared {
 
 impl Shared {
     fn emit_event(&self, event: CentralEvent) {
-        if let Some(manager) = self.manager.upgrade() {
-            manager.emit(event);
-        } else {
-            trace!("Could not emit an event. AdapterManager has been dropped");
+        match self.manager.upgrade() {
+            Some(manager) => {
+                manager.emit(event);
+            }
+            _ => {
+                trace!("Could not emit an event. AdapterManager has been dropped");
+            }
         }
     }
 }
@@ -84,6 +88,7 @@ impl Peripheral {
     pub(crate) fn new(
         uuid: Uuid,
         local_name: Option<String>,
+        advertisement_name: Option<String>,
         manager: Weak<AdapterManager<Self>>,
         event_receiver: Receiver<PeripheralEventInternal>,
         message_sender: Sender<CoreBluetoothMessage>,
@@ -94,6 +99,8 @@ impl Peripheral {
             address: BDAddr::default(),
             address_type: None,
             local_name,
+            advertisement_name,
+            appearance: None,
             tx_power_level: None,
             rssi: None,
             manufacturer_data: HashMap::new(),
@@ -110,6 +117,7 @@ impl Peripheral {
             notifications_channel,
             uuid,
             message_sender,
+            mtu: AtomicU16::new(crate::api::DEFAULT_MTU_SIZE),
         });
         let shared_clone = shared.clone();
         task::spawn(async move {
@@ -118,8 +126,12 @@ impl Peripheral {
 
             loop {
                 match event_receiver.next().await {
-                    Some(PeripheralEventInternal::Notification(uuid, data)) => {
-                        let notification = ValueNotification { uuid, value: data };
+                    Some(PeripheralEventInternal::Notification(uuid, service_uuid, data)) => {
+                        let notification = ValueNotification {
+                            uuid,
+                            service_uuid,
+                            value: data,
+                        };
 
                         // Note: we ignore send errors here which may happen while there are no
                         // receivers...
@@ -132,20 +144,12 @@ impl Peripheral {
                     )) => {
                         let mut properties = shared.properties.lock().unwrap();
                         properties.rssi = Some(rssi);
-
-                        match properties.manufacturer_data.get(&manufacturer_id) {
-                            Some(old) => {
-                                if old.len() < data.len() {
-                                    properties
-                                        .manufacturer_data
-                                        .insert(manufacturer_id, data.clone());
-                                }
-                            }
-                            _ => {
-                                properties
-                                    .manufacturer_data
-                                    .insert(manufacturer_id, data.clone());
-                            }
+                        let previous = properties
+                            .manufacturer_data
+                            .entry(manufacturer_id)
+                            .or_default();
+                        if previous.len() < data.len() {
+                            *previous = data.clone();
                         }
                         shared.emit_event(CentralEvent::ManufacturerDataAdvertisement {
                             id: shared.uuid.into(),
@@ -172,6 +176,20 @@ impl Peripheral {
                             services,
                         });
                     }
+                    Some(PeripheralEventInternal::ServicesModified) => {
+                        shared.services.lock().unwrap().clear();
+                        shared.emit_event(CentralEvent::DeviceServicesModified(shared.uuid.into()));
+                    }
+                    Some(PeripheralEventInternal::TxPowerLevel(tx_power_level)) => {
+                        let mut properties = shared.properties.lock().unwrap();
+                        properties.tx_power_level = Some(tx_power_level);
+                    }
+                    Some(PeripheralEventInternal::RssiRead(rssi)) => {
+                        shared.emit_event(CentralEvent::RssiUpdate {
+                            id: shared.uuid.into(),
+                            rssi,
+                        });
+                    }
                     Some(PeripheralEventInternal::Disconnected) => (),
                     None => {
                         info!("Event receiver died, breaking out of corebluetooth device loop.");
@@ -180,11 +198,43 @@ impl Peripheral {
                 }
             }
         });
-        Self { shared: shared }
+        Self { shared }
     }
 
-    pub(super) fn update_name(&self, name: &str) {
-        self.shared.properties.lock().unwrap().local_name = Some(name.to_string());
+    pub(super) fn update_name(
+        &self,
+        local_name: Option<String>,
+        advertisement_name: Option<String>,
+    ) {
+        if let Ok(mut props) = self.shared.properties.lock() {
+            let PeripheralProperties {
+                local_name: current_local_name,
+                advertisement_name: current_advertisement_name,
+                ..
+            } = &mut *props;
+            merge_names(
+                current_local_name,
+                current_advertisement_name,
+                local_name,
+                advertisement_name,
+            );
+        }
+    }
+}
+
+fn merge_names(
+    local_name: &mut Option<String>,
+    advertisement_name: &mut Option<String>,
+    new_local_name: Option<String>,
+    new_advertisement_name: Option<String>,
+) {
+    if let Some(name) = new_advertisement_name {
+        *local_name = Some(name.clone());
+        *advertisement_name = Some(name);
+    } else if advertisement_name.is_none()
+        && let Some(name) = new_local_name
+    {
+        *local_name = Some(name);
     }
 }
 
@@ -195,6 +245,134 @@ impl Display for Peripheral {
         // write!(f, "{} {}{}", self.address, properties.local_name.clone()
         //     .unwrap_or_else(|| "(unknown)".to_string()), connected)
         write!(f, "Peripheral")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertisement_name_takes_precedence_over_gap_name() {
+        let mut local_name = Some("Longer GAP name".to_string());
+        let mut advertisement_name = None;
+
+        merge_names(
+            &mut local_name,
+            &mut advertisement_name,
+            Some("Short GAP".to_string()),
+            Some("Complete".to_string()),
+        );
+
+        assert_eq!(local_name.as_deref(), Some("Complete"));
+        assert_eq!(advertisement_name.as_deref(), Some("Complete"));
+    }
+
+    #[test]
+    fn absent_advertisement_does_not_erase_or_override_it() {
+        let mut local_name = Some("Complete".to_string());
+        let mut advertisement_name = Some("Complete".to_string());
+
+        merge_names(
+            &mut local_name,
+            &mut advertisement_name,
+            Some("Different GAP name".to_string()),
+            None,
+        );
+
+        assert_eq!(local_name.as_deref(), Some("Complete"));
+        assert_eq!(advertisement_name.as_deref(), Some("Complete"));
+    }
+
+    /// Drive the public Peripheral subscribe/unsubscribe path with a fake
+    /// message receiver that refuses the request, so the real reply future
+    /// resolves through the production error mapping.
+    async fn refused_notification_request_maps_to_runtime_error(enabled: bool) {
+        use futures::channel::mpsc;
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_secs(2);
+
+        let peripheral_uuid = Uuid::from_u128(0x12345678_1234_5678_1234_567812345678);
+        let service_uuid = Uuid::from_u128(0x0000180f_0000_1000_8000_00805f9b34fb);
+        let characteristic_uuid = Uuid::from_u128(0x00002a19_0000_1000_8000_00805f9b34fb);
+        let (message_sender, mut message_receiver) = mpsc::channel(1);
+        let (_event_sender, event_receiver) = mpsc::channel(1);
+        let peripheral = Peripheral::new(
+            peripheral_uuid,
+            None,
+            None,
+            Weak::<AdapterManager<Peripheral>>::new(),
+            event_receiver,
+            message_sender,
+        );
+        let characteristic = Characteristic {
+            uuid: characteristic_uuid,
+            service_uuid,
+            properties: CharPropFlags::NOTIFY,
+            descriptors: Default::default(),
+        };
+
+        let task_peripheral = peripheral.clone();
+        let task_characteristic = characteristic.clone();
+        let request = tokio::spawn(async move {
+            if enabled {
+                api::Peripheral::subscribe(&task_peripheral, &task_characteristic).await
+            } else {
+                api::Peripheral::unsubscribe(&task_peripheral, &task_characteristic).await
+            }
+        });
+
+        let message = tokio::time::timeout(TIMEOUT, message_receiver.next())
+            .await
+            .expect("notification request did not send a message")
+            .expect("message channel closed");
+        let future = match message {
+            CoreBluetoothMessage::Subscribe { future, .. }
+            | CoreBluetoothMessage::Unsubscribe { future, .. } => future,
+            message => panic!("unexpected message: {message:?}"),
+        };
+
+        let error_text = "The operation couldn’t be completed. (ATT error 15.)".to_string();
+        future
+            .lock()
+            .unwrap()
+            .set_reply(CoreBluetoothReply::Err(error_text.clone()));
+
+        let result = tokio::time::timeout(TIMEOUT, request)
+            .await
+            .expect("notification request did not complete")
+            .expect("notification request task panicked");
+        match result {
+            Err(Error::RuntimeError(actual)) => assert_eq!(actual, error_text),
+            result => panic!("unexpected notification request result: {result:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_subscribe_maps_to_public_runtime_error() {
+        refused_notification_request_maps_to_runtime_error(true).await;
+    }
+
+    #[tokio::test]
+    async fn refused_unsubscribe_maps_to_public_runtime_error() {
+        refused_notification_request_maps_to_runtime_error(false).await;
+    }
+
+    #[test]
+    fn gap_name_is_used_until_an_advertisement_name_arrives() {
+        let mut local_name = None;
+        let mut advertisement_name = None;
+
+        merge_names(
+            &mut local_name,
+            &mut advertisement_name,
+            Some("GAP name".to_string()),
+            None,
+        );
+
+        assert_eq!(local_name.as_deref(), Some("GAP name"));
+        assert_eq!(advertisement_name, None);
     }
 }
 
@@ -217,6 +395,10 @@ impl api::Peripheral for Peripheral {
 
     fn address(&self) -> BDAddr {
         BDAddr::default()
+    }
+
+    fn mtu(&self) -> u16 {
+        self.shared.mtu.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn properties(&self) -> Result<Option<PeripheralProperties>> {
@@ -248,28 +430,7 @@ impl api::Peripheral for Peripheral {
                 CBPeripheralState::Connected => Ok(true),
                 _ => Ok(false),
             },
-            CoreBluetoothReply::NotFound => Err(Error::DeviceNotFound),
             _ => panic!("Shouldn't get anything but a State!"),
-        }
-    }
-
-    async fn mtu(&self, characteristics: Option<&[Characteristic]>) -> Result<u16> {
-        let fut = CoreBluetoothReplyFuture::default();
-        let characteristics = characteristics.map(|characteristics| characteristics.to_vec());
-        self.shared
-            .message_sender
-            .to_owned()
-            .send(CoreBluetoothMessage::GetMtu {
-                peripheral_uuid: self.shared.uuid,
-                characteristics,
-                future: fut.get_state_clone(),
-            })
-            .await?;
-        match fut.await {
-            CoreBluetoothReply::Mtu(mtu) => Ok(mtu),
-            CoreBluetoothReply::NotFound => Err(Error::DeviceNotFound),
-            CoreBluetoothReply::Err(msg) => Err(Error::RuntimeError(msg)),
-            reply => panic!("Unexpected reply: {:?}", reply),
         }
     }
 
@@ -284,12 +445,13 @@ impl api::Peripheral for Peripheral {
             })
             .await?;
         match fut.await {
-            CoreBluetoothReply::Connected(services) => {
-                *(self.shared.services.lock().map_err(Into::<Error>::into)?) = services;
+            CoreBluetoothReply::Connected => {
+                self.shared
+                    .mtu
+                    .store(api::DEFAULT_MTU_SIZE, std::sync::atomic::Ordering::Relaxed);
                 self.shared
                     .emit_event(CentralEvent::DeviceConnected(self.shared.uuid.into()));
             }
-            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             _ => panic!("Shouldn't get anything but connected or err!"),
         }
@@ -313,15 +475,32 @@ impl api::Peripheral for Peripheral {
                     .emit_event(CentralEvent::DeviceDisconnected(self.shared.uuid.into()));
                 trace!("Device disconnected!");
             }
-            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             _ => error!("Shouldn't get anything but Ok!"),
         }
         Ok(())
     }
 
     async fn discover_services(&self) -> Result<()> {
-        // TODO: Actually discover on this, rather than on connection
-        Ok(())
+        let fut = CoreBluetoothReplyFuture::default();
+        self.shared
+            .message_sender
+            .to_owned()
+            .send(CoreBluetoothMessage::DiscoverServices {
+                peripheral_uuid: self.shared.uuid,
+                future: fut.get_state_clone(),
+            })
+            .await?;
+        match fut.await {
+            CoreBluetoothReply::ServicesDiscovered(services, mtu) => {
+                *(self.shared.services.lock().map_err(Into::<Error>::into)?) = services;
+                self.shared
+                    .mtu
+                    .store(mtu, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
+            _ => panic!("Shouldn't get anything but discovered or err!"),
+        }
     }
 
     async fn write(
@@ -355,7 +534,6 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::Ok => {}
-            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             reply => panic!("Unexpected reply: {:?}", reply),
         }
@@ -376,7 +554,6 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::ReadResult(chars) => Ok(chars),
-            CoreBluetoothReply::NotFound => Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             _ => {
                 panic!("Shouldn't get anything but read result!");
@@ -398,7 +575,6 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::Ok => trace!("subscribed!"),
-            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             _ => panic!("Didn't subscribe!"),
         }
@@ -419,7 +595,6 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::Ok => {}
-            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
             CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
             _ => panic!("Didn't unsubscribe!"),
         }
@@ -447,10 +622,32 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::Ok => {}
-            CoreBluetoothReply::NotFound => return Err(Error::DeviceNotFound),
-            reply => panic!("Unexpected reply: {:?}", reply),
+            CoreBluetoothReply::Err(msg) => return Err(Error::RuntimeError(msg)),
+            reply => {
+                return Err(Error::RuntimeError(format!(
+                    "Unexpected reply: {:?}",
+                    reply
+                )));
+            }
         }
         Ok(())
+    }
+
+    async fn read_rssi(&self) -> Result<i16> {
+        let fut = CoreBluetoothReplyFuture::default();
+        self.shared
+            .message_sender
+            .to_owned()
+            .send(CoreBluetoothMessage::ReadRssi {
+                peripheral_uuid: self.shared.uuid,
+                future: fut.get_state_clone(),
+            })
+            .await?;
+        match fut.await {
+            CoreBluetoothReply::ReadRssi(rssi) => Ok(rssi),
+            CoreBluetoothReply::Err(msg) => Err(Error::RuntimeError(msg)),
+            _ => panic!("Unexpected reply for read_rssi"),
+        }
     }
 
     async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
@@ -468,10 +665,10 @@ impl api::Peripheral for Peripheral {
             .await?;
         match fut.await {
             CoreBluetoothReply::ReadResult(chars) => Ok(chars),
-            CoreBluetoothReply::NotFound => Err(Error::DeviceNotFound),
-            _ => {
-                panic!("Shouldn't get anything but read result!");
-            }
+            CoreBluetoothReply::Err(msg) => Err(Error::RuntimeError(msg)),
+            _ => Err(Error::RuntimeError(
+                "Unexpected reply for descriptor read".into(),
+            )),
         }
     }
 }

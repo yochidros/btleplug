@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use bluez_async::{
-    BluetoothEvent, BluetoothSession, CharacteristicEvent, CharacteristicFlags, CharacteristicId,
-    CharacteristicInfo, DescriptorInfo, DeviceId, DeviceInfo, MacAddress, ServiceInfo,
-    WriteOptions,
+    BluetoothError, BluetoothEvent, BluetoothSession, CharacteristicEvent, CharacteristicFlags,
+    CharacteristicId, CharacteristicInfo, DescriptorInfo, DeviceId, DeviceInfo, MacAddress,
+    ServiceInfo, WriteOptions,
 };
 use futures::future::{join_all, ready};
 use futures::stream::{Stream, StreamExt};
@@ -138,12 +138,23 @@ impl api::Peripheral for Peripheral {
         self.mac_address
     }
 
+    fn mtu(&self) -> u16 {
+        let services = self.services.lock().unwrap();
+        services
+            .values()
+            .flat_map(|s| s.characteristics.values())
+            .find_map(|c| c.info.mtu)
+            .unwrap_or(api::DEFAULT_MTU_SIZE)
+    }
+
     async fn properties(&self) -> Result<Option<PeripheralProperties>> {
         let device_info = self.device_info().await?;
         Ok(Some(PeripheralProperties {
             address: device_info.mac_address.into(),
             address_type: Some(device_info.address_type.into()),
-            local_name: device_info.name,
+            local_name: device_info.alias.or(device_info.name.clone()),
+            advertisement_name: device_info.name,
+            appearance: device_info.appearance,
             tx_power_level: device_info.tx_power,
             rssi: device_info.rssi,
             manufacturer_data: device_info.manufacturer_data,
@@ -165,22 +176,6 @@ impl api::Peripheral for Peripheral {
     async fn is_connected(&self) -> Result<bool> {
         let device_info = self.device_info().await?;
         Ok(device_info.connected)
-    }
-
-    async fn mtu(&self, _characteristics: Option<&[Characteristic]>) -> Result<u16> {
-        if self.services.lock().map_err(Into::<Error>::into)?.is_empty() {
-            self.discover_services().await?;
-        }
-        let services = self.services.lock().map_err(Into::<Error>::into)?;
-        let mut max_mtu: Option<u16> = None;
-        for service in services.values() {
-            for characteristic in service.characteristics.values() {
-                if let Some(mtu) = characteristic.info.mtu {
-                    max_mtu = Some(max_mtu.map_or(mtu, |current| current.max(mtu)));
-                }
-            }
-        }
-        max_mtu.ok_or_else(|| Error::NotSupported("MTU not available".to_string()))
     }
 
     async fn connect(&self) -> Result<()> {
@@ -206,9 +201,7 @@ impl api::Peripheral for Peripheral {
                         // This "should" be unique, but of course it's not enforced
                         HashMap::<Uuid, CharacteristicInfo>::new(),
                         |mut map, characteristic| {
-                            if !map.contains_key(&characteristic.uuid) {
-                                map.insert(characteristic.uuid, characteristic);
-                            }
+                            map.entry(characteristic.uuid).or_insert(characteristic);
                             map
                         },
                     )
@@ -274,7 +267,10 @@ impl api::Peripheral for Peripheral {
 
     async fn unsubscribe(&self, characteristic: &Characteristic) -> Result<()> {
         let characteristic_info = self.characteristic_info(characteristic)?;
-        Ok(self.session.stop_notify(&characteristic_info.id).await?)
+        match self.session.stop_notify(&characteristic_info.id).await {
+            Err(BluetoothError::DbusError(e)) if is_no_notify_session(&e) => Ok(()),
+            result => Ok(result?),
+        }
     }
 
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
@@ -284,6 +280,11 @@ impl api::Peripheral for Peripheral {
         Ok(Box::pin(events.filter_map(move |event| {
             ready(value_notification(event, &device_id, services.clone()))
         })))
+    }
+
+    async fn read_rssi(&self) -> Result<i16> {
+        let device_info = self.device_info().await?;
+        device_info.rssi.ok_or(Error::NotConnected)
     }
 
     async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
@@ -314,8 +315,12 @@ fn value_notification(
             event: CharacteristicEvent::Value { value },
         } if id.service().device() == *device_id => {
             let services = services.lock().unwrap();
-            let uuid = find_characteristic_by_id(&services, id)?.uuid;
-            Some(ValueNotification { uuid, value })
+            let (charac, service) = find_characteristic_by_id(&services, id.clone())?;
+            Some(ValueNotification {
+                uuid: charac.uuid,
+                service_uuid: service.uuid,
+                value,
+            })
         }
         _ => None,
     }
@@ -324,11 +329,11 @@ fn value_notification(
 fn find_characteristic_by_id(
     services: &HashMap<Uuid, ServiceInternal>,
     characteristic_id: CharacteristicId,
-) -> Option<&CharacteristicInfo> {
+) -> Option<(&CharacteristicInfo, &ServiceInfo)> {
     for service in services.values() {
         for characteristic in service.characteristics.values() {
             if characteristic.info.id == characteristic_id {
-                return Some(&characteristic.info);
+                return Some((&characteristic.info, &service.info));
             }
         }
     }
@@ -386,8 +391,8 @@ fn make_characteristic(
         uuid: info.uuid,
         properties: info.flags.into(),
         descriptors: descriptors
-            .iter()
-            .map(|(_, descriptor)| make_descriptor(descriptor, info.uuid, service_uuid))
+            .values()
+            .map(|descriptor| make_descriptor(descriptor, info.uuid, service_uuid))
             .collect(),
         service_uuid,
     }
@@ -435,5 +440,32 @@ impl From<CharacteristicFlags> for CharPropFlags {
             result.insert(CharPropFlags::EXTENDED_PROPERTIES);
         }
         result
+    }
+}
+
+/// BlueZ tracks notify sessions per D-Bus client and rejects `StopNotify` when this client has none
+/// (e.g. a repeated unsubscribe). There is nothing for this client to stop, so treat it as success.
+fn is_no_notify_session(error: &dbus::Error) -> bool {
+    error.name() == Some("org.bluez.Error.Failed")
+        && error.message() == Some("No notify session started")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_no_notify_session;
+
+    #[test]
+    fn no_notify_session_error_is_recognised() {
+        let error = dbus::Error::new_custom("org.bluez.Error.Failed", "No notify session started");
+        assert!(is_no_notify_session(&error));
+    }
+
+    #[test]
+    fn other_bluez_failures_are_not_recognised() {
+        let error = dbus::Error::new_custom("org.bluez.Error.Failed", "Not connected");
+        assert!(!is_no_notify_session(&error));
+        let error =
+            dbus::Error::new_custom("org.bluez.Error.NotPermitted", "No notify session started");
+        assert!(!is_no_notify_session(&error));
     }
 }

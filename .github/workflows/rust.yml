@@ -39,14 +39,14 @@ jobs:
       CARGO_BUILD_TARGET: ${{ matrix.cbt }}
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Install dependencies
         if: ${{ runner.os == 'Linux' }}
         run: |
           sudo apt-get update
-          sudo apt-get install libdbus-1-dev
-      - uses: actions/setup-java@v2
-        if: ${{ matrix.target == 'android' }}
+          sudo apt-get install libdbus-1-dev openjdk-17-jdk
+      - uses: actions/setup-java@v5
+        if: ${{ matrix.target == 'android' || matrix.target == 'linux' }}
         with:
           distribution: 'zulu'
           java-version: '17'
@@ -71,20 +71,29 @@ jobs:
         run: cargo check --all --bins --examples --no-default-features
       - name: Check with all features
         run: cargo check --all --bins --examples --all-features
+      - name: Run JNI host tests
+        if: ${{ matrix.target == 'linux' }}
+        run: ./scripts/run-jni-tests.sh
       - name: Run tests
         if: ${{ matrix.target != 'android' }}
         run: cargo test --all
+      - name: Build Android library and test app
+        if: ${{ matrix.target == 'android' }}
+        run: |
+          ./scripts/build-java.sh
+          cp src/droidplug/java/gradlew tests/android/
+          cp -r src/droidplug/java/gradle tests/android/
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > tests/android/local.properties
+          cd tests/android
+          chmod +x gradlew
+          ./gradlew assembleDebug assembleAndroidTest
       - name: Run clippy
-        uses: actions-rs/clippy-check@v1
-        with:
-          name: clippy ${{ matrix.os }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-features
+        run: cargo clippy --all-features -- -D warnings
 
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Format Rust code
         run: cargo fmt --all -- --check
 
@@ -100,7 +109,7 @@ jobs:
 #    env:
 #      RUSTC_BOOTSTRAP: 1
 #    steps:
-#      - uses: actions/checkout@v2
+#      - uses: actions/checkout@v4
 #      - name: Install dependencies
 #        if: ${{ runner.os == 'Linux' }}
 #        run: sudo apt-get install libdbus-1-dev

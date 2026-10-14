@@ -1,19 +1,27 @@
+use super::jni::{
+    jvm,
+    objects::{JBluetoothGattCharacteristic, JBluetoothGattService, JPeripheral},
+};
+use super::jni_utils::{
+    arrays::byte_array_to_vec,
+    exceptions::throwable_to_string,
+    future::{JFuture, JSendFuture},
+    stream::JSendStream,
+    task::JPollResult,
+    uuid::JUuid,
+};
 use crate::{
-    api::{
-        self, BDAddr, Characteristic, Descriptor, PeripheralProperties, Service, ValueNotification,
-        WriteType,
-    },
-    common::adapter_manager::AdapterManager,
     Error, Result,
+    api::{
+        self, BDAddr, Characteristic, ConnectionParameterPreset, ConnectionParameters, Descriptor,
+        PeripheralProperties, Service, ValueNotification, WriteType,
+    },
 };
 use async_trait::async_trait;
 use futures::stream::Stream;
 use jni::{
-    objects::{GlobalRef, JByteArray, JList, JObject, JString, JThrowable},
-    JNIEnv,
-};
-use jni_utils::{
-    exceptions::try_block, future::JSendFuture, stream::JSendStream, task::JPollResult, uuid::JUuid,
+    Env, jni_sig, jni_str,
+    objects::{Global, JObject, JString, JThrowable, JValue},
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -21,17 +29,12 @@ use serde::{Deserialize, Serialize};
 use serde_cr as serde;
 use std::{
     collections::BTreeSet,
-    convert::TryFrom,
     fmt::{self, Debug, Display, Formatter},
     pin::Pin,
-    sync::{Arc, Mutex, Weak},
+    sync::atomic::{AtomicU16, Ordering},
+    sync::{Arc, Mutex},
 };
 
-use super::jni::{
-    global_jvm,
-    objects::{JBluetoothGattCharacteristic, JBluetoothGattService, JPeripheral},
-};
-use jni::objects::JClass;
 #[cfg_attr(
     feature = "serde",
     derive(Serialize, Deserialize),
@@ -45,179 +48,91 @@ impl Display for PeripheralId {
     }
 }
 
-fn map_future_exception<'a>(
-    env: &mut JNIEnv<'a>,
-    ex: JThrowable<'a>,
-) -> std::result::Result<Error, jni::errors::Error> {
-    let ex_obj: JObject = ex.into();
-    let cause = env
-        .call_method(&ex_obj, "getCause", "()Ljava/lang/Throwable;", &[])?
-        .l()?;
-    if env.is_instance_of(
-        &cause,
-        <&JClass>::from(
-            jni_utils::classcache::get_class(
-                "com/nonpolynomial/btleplug/android/impl/NotConnectedException",
-            )
-            .unwrap()
-            .as_obj(),
-        ),
-    )? {
-        Ok(Error::NotConnected)
-    } else if env.is_instance_of(
-        &cause,
-        <&JClass>::from(
-            jni_utils::classcache::get_class(
-                "com/nonpolynomial/btleplug/android/impl/PermissionDeniedException",
-            )
-            .unwrap()
-            .as_obj(),
-        ),
-    )? {
-        Ok(Error::PermissionDenied)
-    } else if env.is_instance_of(
-        &cause,
-        <&JClass>::from(
-            jni_utils::classcache::get_class(
-                "com/nonpolynomial/btleplug/android/impl/UnexpectedCallbackException",
-            )
-            .unwrap()
-            .as_obj(),
-        ),
-    )? {
-        Ok(Error::UnexpectedCallback)
-    } else if env.is_instance_of(
-        &cause,
-        <&JClass>::from(
-            jni_utils::classcache::get_class(
-                "com/nonpolynomial/btleplug/android/impl/UnexpectedCharacteristicException",
-            )
-            .unwrap()
-            .as_obj(),
-        ),
-    )? {
-        Ok(Error::UnexpectedCharacteristic)
-    } else if env.is_instance_of(
-        &cause,
-        <&JClass>::from(
-            jni_utils::classcache::get_class(
-                "com/nonpolynomial/btleplug/android/impl/NoSuchCharacteristicException",
-            )
-            .unwrap()
-            .as_obj(),
-        ),
-    )? {
-        Ok(Error::NoSuchCharacteristic)
-    } else if env.is_instance_of(&cause, "java/lang/RuntimeException")? {
-        let msg = env
-            .call_method(&cause, "getMessage", "()Ljava/lang/String;", &[])?
-            .l()?;
-        let msg: JString = msg.into();
-        let msgstr: String = env.get_string(&msg)?.into();
-        Ok(Error::RuntimeError(msgstr))
-    } else {
-        env.throw(JThrowable::from(ex_obj))?;
-        Err(jni::errors::Error::JavaException)
-    }
-}
+fn get_poll_result<'a>(
+    env: &mut Env<'a>,
+    result_ref: &Global<JObject<'static>>,
+) -> Result<JObject<'a>> {
+    let result_obj = env.new_local_ref(result_ref)?;
+    let poll_result = env.cast_local::<JPollResult>(result_obj)?;
 
-fn check_pending_exception(env: &mut JNIEnv) -> Result<()> {
-    if !env.exception_check()? {
-        return Ok(());
-    }
-    let ex = env.exception_occurred()?;
-    env.exception_clear()?;
-    if env.is_instance_of(
-        &ex,
-        <&JClass>::from(
-            jni_utils::classcache::get_class("io/github/gedgygedgy/rust/future/FutureException")
-                .unwrap()
-                .as_obj(),
-        ),
-    )? {
-        let err = map_future_exception(env, ex).map_err(Into::<Error>::into)?;
-        return Err(err);
-    }
-    env.throw(ex)?;
-    Err(jni::errors::Error::JavaException.into())
-}
-
-fn poll_result_from_future<'a>(
-    env: &mut JNIEnv<'a>,
-    result_ref: &GlobalRef,
-) -> Result<JPollResult<'a>> {
-    check_pending_exception(env)?;
-    let result_obj = match env.new_local_ref(result_ref.as_obj()) {
-        Ok(obj) => obj,
-        Err(jni::errors::Error::JavaException) => {
-            let ex = env.exception_occurred()?;
-            env.exception_clear()?;
-            return if env.is_instance_of(
-                &ex,
-                <&JClass>::from(
-                    jni_utils::classcache::get_class(
-                        "io/github/gedgygedgy/rust/future/FutureException",
-                    )
-                    .unwrap()
-                    .as_obj(),
-                ),
-            )? {
-                Err(map_future_exception(env, ex)?)
-            } else {
-                env.throw(ex)?;
-                Err(jni::errors::Error::JavaException.into())
-            };
-        }
-        Err(err) => return Err(err.into()),
-    };
-    Ok(JPollResult::from_env(env, result_obj)?)
-}
-
-fn get_poll_result<'a>(env: &mut JNIEnv<'a>, result: JPollResult<'a>) -> Result<JObject<'a>> {
-    match result.get() {
+    match poll_result.get(env) {
         Ok(obj) => Ok(obj),
         Err(jni::errors::Error::JavaException) => {
-            let ex = env.exception_occurred()?;
-            env.exception_clear()?;
-            if env.is_instance_of(
-                &ex,
-                <&JClass>::from(
-                    jni_utils::classcache::get_class(
-                        "io/github/gedgygedgy/rust/future/FutureException",
-                    )
-                    .unwrap()
-                    .as_obj(),
-                ),
-            )? {
-                Err(map_future_exception(env, ex)?)
+            let ex = env.exception_occurred().unwrap();
+            env.exception_clear();
+
+            use super::jni::objects::*;
+            use jni::objects::Reference;
+
+            let future_ex_class =
+                <super::jni_utils::future::JFutureException as Reference>::lookup_class(
+                    env,
+                    &Default::default(),
+                )?;
+
+            if env.is_instance_of(&ex, &*future_ex_class)? {
+                let cause = env
+                    .call_method(
+                        &ex,
+                        jni_str!("getCause"),
+                        jni_sig!("()Ljava/lang/Throwable;"),
+                        &[],
+                    )?
+                    .l()?;
+
+                macro_rules! check_exception {
+                    ($type:ty, $env:expr, $cause:expr) => {
+                        $env.is_instance_of(
+                            $cause,
+                            &*<$type as Reference>::lookup_class($env, &Default::default())?,
+                        )?
+                    };
+                }
+
+                if check_exception!(JNotConnectedException, env, &cause) {
+                    Err(Error::NotConnected)
+                } else if check_exception!(JPermissionDeniedException, env, &cause) {
+                    Err(Error::PermissionDenied)
+                } else if check_exception!(JUnexpectedCallbackException, env, &cause) {
+                    Err(Error::UnexpectedCallback)
+                } else if check_exception!(JUnexpectedCharacteristicException, env, &cause) {
+                    Err(Error::UnexpectedCharacteristic)
+                } else if check_exception!(JNoSuchCharacteristicException, env, &cause) {
+                    Err(Error::NoSuchCharacteristic)
+                } else if check_exception!(JNoBluetoothAdapterException, env, &cause) {
+                    Err(Error::NoAdapterAvailable)
+                } else if env.is_instance_of(&cause, jni_str!("java/lang/RuntimeException"))? {
+                    let msg = env
+                        .call_method(
+                            &cause,
+                            jni_str!("getMessage"),
+                            jni_sig!("()Ljava/lang/String;"),
+                            &[],
+                        )?
+                        .l()?;
+                    let jstr = env.cast_local::<JString>(msg)?;
+                    let msgstr = String::from(jstr.mutf8_chars(env)?);
+                    Err(Error::RuntimeError(msgstr))
+                } else {
+                    let cause = if cause.is_null() {
+                        None
+                    } else {
+                        Some(env.cast_local::<JThrowable>(cause)?)
+                    };
+                    let desc = if let Some(cause) = &cause {
+                        throwable_to_string(env, cause)?
+                    } else {
+                        throwable_to_string(env, &ex)?
+                    };
+                    Err(Error::RuntimeError(format!("Java exception: {}", desc)))
+                }
             } else {
-                env.throw(ex)?;
-                Err(jni::errors::Error::JavaException.into())
+                let desc = throwable_to_string(env, &ex)?;
+                Err(Error::RuntimeError(format!("Java exception: {}", desc)))
             }
         }
-        Err(err) => Err(err.into()),
+        Err(e) => Err(e.into()),
     }
-}
-
-pub(crate) fn with_local_env<T, E>(
-    f: impl for<'a> FnOnce(&mut JNIEnv<'a>) -> std::result::Result<T, E>,
-) -> std::result::Result<T, E>
-where
-    E: From<jni::errors::Error>,
-{
-    let mut env = global_jvm().get_env()?;
-    env.with_local_frame(64, f)
-}
-
-fn consume_future_result<T>(
-    result_ref: &GlobalRef,
-    f: impl for<'a> FnOnce(&mut JNIEnv<'a>, JObject<'a>) -> Result<T>,
-) -> Result<T> {
-    with_local_env(|env| {
-        let result = poll_result_from_future(env, result_ref)?;
-        let obj = get_poll_result(env, result)?;
-        f(env, obj)
-    })
 }
 
 #[derive(Debug)]
@@ -231,36 +146,30 @@ struct PeripheralShared {
 #[derive(Clone)]
 pub struct Peripheral {
     addr: BDAddr,
-    internal: GlobalRef,
-    adapter: Weak<AdapterManager<Peripheral>>,
+    internal: Arc<Global<JObject<'static>>>,
     shared: Arc<Mutex<PeripheralShared>>,
+    mtu: Arc<AtomicU16>,
 }
 
 impl Peripheral {
-    pub(crate) fn new<'a>(
-        env: &mut JNIEnv<'a>,
-        adapter: JObject<'a>,
-        addr: BDAddr,
-        manager: Weak<AdapterManager<Peripheral>>,
-    ) -> Result<Self> {
-        let obj = JPeripheral::new(env, adapter, addr)?;
-        let obj_ref: JObject = obj.into();
+    pub(crate) fn new<'a>(env: &mut Env<'a>, adapter: JObject<'a>, addr: BDAddr) -> Result<Self> {
+        let obj = JPeripheral::create(env, adapter, addr)?;
+        let internal = Arc::new(env.new_global_ref(&*obj)?);
         Ok(Self {
             addr,
-            internal: env.new_global_ref(&obj_ref)?,
-            adapter: manager,
+            internal,
             shared: Arc::new(Mutex::new(PeripheralShared {
                 connected: false,
                 services: BTreeSet::new(),
                 characteristics: BTreeSet::new(),
                 properties: None,
             })),
+            mtu: Arc::new(AtomicU16::new(crate::api::DEFAULT_MTU_SIZE)),
         })
     }
 
     pub(crate) fn report_properties(&self, properties: PeripheralProperties) {
         let mut guard = self.shared.lock().unwrap();
-
         guard.properties = Some(properties);
     }
 
@@ -272,25 +181,14 @@ impl Peripheral {
         Arc::strong_count(&self.shared) == 1 && !self.shared.lock().unwrap().connected
     }
 
-    fn with_obj<T, E>(
+    fn with_obj<T>(
         &self,
-        f: impl for<'a> FnOnce(&mut JNIEnv<'a>, JPeripheral<'a>) -> std::result::Result<T, E>,
-    ) -> std::result::Result<T, E>
-    where
-        E: From<::jni::errors::Error>,
-    {
-        with_local_env(|env| {
-            if env.exception_check()? {
-                env.exception_clear()?;
-                return Err(::jni::errors::Error::JavaException.into());
-            }
-            let obj = env.new_local_ref(self.internal.as_obj())?;
-            if env.exception_check()? {
-                env.exception_clear()?;
-                return Err(::jni::errors::Error::JavaException.into());
-            }
-            let obj = JPeripheral::from_env(env, obj)?;
-            f(env, obj)
+        f: impl for<'env> FnOnce(&mut Env<'env>, &JPeripheral<'env>) -> Result<T>,
+    ) -> Result<T> {
+        jvm()?.attach_current_thread(|env| {
+            let local_obj = env.new_local_ref(self.internal.as_obj())?;
+            let obj = env.cast_local::<JPeripheral>(local_obj)?;
+            f(env, &obj)
         })
     }
 
@@ -299,23 +197,13 @@ impl Peripheral {
         characteristic: &Characteristic,
         enable: bool,
     ) -> Result<()> {
-        self.ensure_available()?;
         let future = self.with_obj(|env, obj| {
             let uuid_obj = JUuid::new(env, characteristic.uuid)?;
-            JSendFuture::try_from(obj.set_characteristic_notification(uuid_obj, enable)?)
+            let future = obj.set_characteristic_notification(env, &uuid_obj, enable)?;
+            Ok(JSendFuture::new(env, &future)?)
         })?;
         let result_ref = future.await?;
-        consume_future_result(&result_ref, |_env, _obj| Ok(()))
-    }
-
-    fn ensure_available(&self) -> Result<()> {
-        let manager = self.adapter.upgrade().ok_or(Error::DeviceNotFound)?;
-        let id = PeripheralId(self.addr);
-        if manager.peripheral(&id).is_some() {
-            Ok(())
-        } else {
-            Err(Error::DeviceNotFound)
-        }
+        self.with_obj(|env, _obj| get_poll_result(env, &result_ref).map(|_| {}))
     }
 }
 
@@ -327,7 +215,6 @@ impl Debug for Peripheral {
 
 #[async_trait]
 impl api::Peripheral for Peripheral {
-    /// Returns the unique identifier of the peripheral.
     fn id(&self) -> PeripheralId {
         PeripheralId(self.addr)
     }
@@ -336,119 +223,141 @@ impl api::Peripheral for Peripheral {
         self.addr
     }
 
+    fn mtu(&self) -> u16 {
+        self.mtu.load(Ordering::Relaxed)
+    }
+
     async fn properties(&self) -> Result<Option<PeripheralProperties>> {
         let guard = self.shared.lock().map_err(Into::<Error>::into)?;
-        Ok((&guard.properties).clone())
+        Ok(guard.properties.clone())
     }
 
     fn characteristics(&self) -> BTreeSet<Characteristic> {
         let guard = self.shared.lock().unwrap();
-        (&guard.characteristics).clone()
+        guard.characteristics.clone()
     }
 
     async fn is_connected(&self) -> Result<bool> {
-        self.ensure_available()?;
-        self.with_obj(|_env, obj| Ok(obj.is_connected()?))
-    }
-
-    async fn mtu(&self, _characteristics: Option<&[Characteristic]>) -> Result<u16> {
-        self.ensure_available()?;
-        self.with_obj(|env, obj| {
-            let result = try_block(env, |_env| Ok(Ok(obj.get_mtu()?)))
-                .catch(
-                    <&JClass>::from(
-                        jni_utils::classcache::get_class(
-                            "com/nonpolynomial/btleplug/android/impl/NotConnectedException",
-                        )
-                        .unwrap()
-                        .as_obj(),
-                    ),
-                    |_env, _ex| Ok(Err(Error::NotConnected)),
-                )
-                .result()?
-                .map_err(Into::<Error>::into)?;
-            u16::try_from(result).map_err(|_| Error::Other("MTU conversion failed".into()))
-        })
+        self.with_obj(|env, obj| Ok(obj.is_connected(env)?))
     }
 
     async fn connect(&self) -> Result<()> {
-        self.ensure_available()?;
-        let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.connect()?))?;
-        let result_ref = future.await?;
-        consume_future_result(&result_ref, |_env, _obj| Ok(()))?;
-        // 完了通知が接続イベントより先に届いても、ハンドルを返す前に保護する。
+        {
+            let future = self.with_obj(|env, obj| {
+                let future = obj.connect(env)?;
+                Ok(JSendFuture::new(env, &future)?)
+            })?;
+            let result_ref = future.await?;
+            self.with_obj(|env, _obj| get_poll_result(env, &result_ref).map(|_| {}))?;
+        }
         self.report_connected(true);
+        // Query the system-cached device name and update local_name
+        self.with_obj(|env, obj| -> std::result::Result<(), Error> {
+            if let Ok(Some(name)) = obj.get_device_name(env) {
+                let mut guard = self.shared.lock().map_err(Into::<Error>::into)?;
+                if let Some(ref mut props) = guard.properties {
+                    props.local_name = Some(name);
+                }
+            }
+            Ok(())
+        })?;
+        // Auto-negotiate maximum MTU (517) after connection
+        {
+            let mtu_future = self.with_obj(|env, obj| {
+                let mtu_obj = obj.request_mtu(env, 517)?;
+                let mtu_future = env.cast_local::<JFuture>(mtu_obj)?;
+                Ok(JSendFuture::new(env, &mtu_future)?)
+            })?;
+            let mtu_result_ref = mtu_future.await?;
+            self.with_obj(|env, _obj| -> Result<()> {
+                let mtu_obj = get_poll_result(env, &mtu_result_ref)?;
+                let mtu_val = env
+                    .call_method(&mtu_obj, jni_str!("intValue"), jni_sig!("()I"), &[])?
+                    .i()?;
+                self.mtu.store(mtu_val as u16, Ordering::Relaxed);
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 
     async fn disconnect(&self) -> Result<()> {
-        self.ensure_available()?;
-        let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.disconnect()?))?;
+        let future = self.with_obj(|env, obj| {
+            let future = obj.disconnect(env)?;
+            Ok(JSendFuture::new(env, &future)?)
+        })?;
         let result_ref = future.await?;
-        consume_future_result(&result_ref, |_env, _obj| Ok(()))
+        self.with_obj(|env, _obj| get_poll_result(env, &result_ref).map(|_| {}))
     }
 
-    /// The set of services we've discovered for this device. This will be empty until
-    /// `discover_services` is called.
     fn services(&self) -> BTreeSet<Service> {
         let guard = self.shared.lock().unwrap();
-        (&guard.services).clone()
+        guard.services.clone()
     }
 
     async fn discover_services(&self) -> Result<()> {
-        self.ensure_available()?;
-        let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.discover_services()?))?;
+        let future = self.with_obj(|env, obj| {
+            let future = obj.discover_services(env)?;
+            Ok(JSendFuture::new(env, &future)?)
+        })?;
         let result_ref = future.await?;
-        use std::iter::FromIterator;
-        let (peripheral_services, peripheral_characteristics) =
-            consume_future_result(&result_ref, |env, obj| {
-                let list = JList::from_env(env, &obj)?;
-                let mut peripheral_services = Vec::new();
-                let mut peripheral_characteristics = Vec::new();
+        self.with_obj(|env, _obj| {
+            use std::iter::FromIterator;
 
-                let mut iter = list.iter(env)?;
-                while let Some(service) = iter.next(env)? {
-                    let service = JBluetoothGattService::from_env(env, service)?;
-                    let mut characteristics = BTreeSet::<Characteristic>::new();
-                    for characteristic in service.get_characteristics()? {
-                        let mut descriptors = BTreeSet::new();
-                        for descriptor in characteristic.get_descriptors()? {
-                            descriptors.insert(Descriptor {
-                                uuid: descriptor.get_uuid()?,
-                                service_uuid: service.get_uuid()?,
-                                characteristic_uuid: characteristic.get_uuid()?,
-                            });
-                        }
-                        let char = Characteristic {
-                            service_uuid: service.get_uuid()?,
-                            uuid: characteristic.get_uuid()?,
-                            properties: characteristic.get_properties()?,
-                            descriptors: descriptors.clone(),
-                        };
-                        // Only consider the first characteristic of each UUID
-                        // This "should" be unique, but of course it's not enforced
-                        if characteristics
-                            .iter()
-                            .filter(|c| c.service_uuid == char.service_uuid && c.uuid == char.uuid)
-                            .count()
-                            == 0
-                        {
-                            characteristics.insert(char.clone());
-                            peripheral_characteristics.push(char.clone());
-                        }
+            let obj = get_poll_result(env, &result_ref)?;
+            let size = env
+                .call_method(&obj, jni_str!("size"), jni_sig!("()I"), &[])?
+                .i()?;
+            let mut peripheral_services = Vec::new();
+            let mut peripheral_characteristics = Vec::new();
+
+            for i in 0..size {
+                let svc_obj = env
+                    .call_method(
+                        &obj,
+                        jni_str!("get"),
+                        jni_sig!("(I)Ljava/lang/Object;"),
+                        &[JValue::from(i)],
+                    )?
+                    .l()?;
+                let service = env.cast_local::<JBluetoothGattService>(svc_obj)?;
+                let mut characteristics = BTreeSet::<Characteristic>::new();
+                for characteristic in service.get_characteristics(env)? {
+                    let mut descriptors = BTreeSet::new();
+                    for descriptor in characteristic.get_descriptors(env)? {
+                        descriptors.insert(Descriptor {
+                            uuid: descriptor.get_uuid(env)?,
+                            service_uuid: service.get_uuid(env)?,
+                            characteristic_uuid: characteristic.get_uuid(env)?,
+                        });
                     }
-                    peripheral_services.push(Service {
-                        uuid: service.get_uuid()?,
-                        primary: service.is_primary()?,
-                        characteristics,
-                    })
+                    let char = Characteristic {
+                        service_uuid: service.get_uuid(env)?,
+                        uuid: characteristic.get_uuid(env)?,
+                        properties: characteristic.get_properties(env)?,
+                        descriptors: descriptors.clone(),
+                    };
+                    if characteristics
+                        .iter()
+                        .filter(|c| c.service_uuid == char.service_uuid && c.uuid == char.uuid)
+                        .count()
+                        == 0
+                    {
+                        characteristics.insert(char.clone());
+                        peripheral_characteristics.push(char.clone());
+                    }
                 }
-                Ok((peripheral_services, peripheral_characteristics))
-            })?;
-        let mut guard = self.shared.lock().map_err(Into::<Error>::into)?;
-        guard.services = BTreeSet::from_iter(peripheral_services.clone());
-        guard.characteristics = BTreeSet::from_iter(peripheral_characteristics.clone());
-        Ok(())
+                peripheral_services.push(Service {
+                    uuid: service.get_uuid(env)?,
+                    primary: service.is_primary()?,
+                    characteristics,
+                })
+            }
+            let mut guard = self.shared.lock().map_err(Into::<Error>::into)?;
+            guard.services = BTreeSet::from_iter(peripheral_services.clone());
+            guard.characteristics = BTreeSet::from_iter(peripheral_characteristics.clone());
+            Ok(())
+        })
     }
 
     async fn write(
@@ -457,92 +366,157 @@ impl api::Peripheral for Peripheral {
         data: &[u8],
         write_type: WriteType,
     ) -> Result<()> {
-        self.ensure_available()?;
         let future = self.with_obj(|env, obj| {
-            let mut local_env = unsafe { env.unsafe_clone() };
-            let uuid = JUuid::new(&mut local_env, characteristic.uuid)?;
-            let data_obj = jni_utils::arrays::slice_to_byte_array(&mut local_env, data)?;
+            let uuid = JUuid::new(env, characteristic.uuid)?;
+            let data_obj = super::jni_utils::arrays::slice_to_byte_array(env, data)?;
             let write_type = match write_type {
                 WriteType::WithResponse => 2,
                 WriteType::WithoutResponse => 1,
             };
-            JSendFuture::try_from(obj.write(uuid, data_obj.into(), write_type)?)
+            let future = obj.write(env, &uuid, &data_obj.into(), write_type)?;
+            Ok(JSendFuture::new(env, &future)?)
         })?;
         let result_ref = future.await?;
-        consume_future_result(&result_ref, |_env, _obj| Ok(()))
+        self.with_obj(|env, _obj| get_poll_result(env, &result_ref).map(|_| {}))
     }
 
     async fn read(&self, characteristic: &Characteristic) -> Result<Vec<u8>> {
-        self.ensure_available()?;
         let future = self.with_obj(|env, obj| {
             let uuid = JUuid::new(env, characteristic.uuid)?;
-            JSendFuture::try_from(obj.read(uuid)?)
+            let future = obj.read(env, &uuid)?;
+            Ok(JSendFuture::new(env, &future)?)
         })?;
         let result_ref = future.await?;
-        consume_future_result(&result_ref, |env, bytes| {
-            Ok(env.convert_byte_array(JByteArray::from(bytes))?)
+        self.with_obj(|env, _obj| {
+            let bytes_obj = get_poll_result(env, &result_ref)?;
+            let bytes_arr =
+                unsafe { jni::objects::JByteArray::from_raw(env, bytes_obj.into_raw()) };
+            Ok(byte_array_to_vec(env, &bytes_arr)?)
         })
     }
 
     async fn subscribe(&self, characteristic: &Characteristic) -> Result<()> {
-        self.ensure_available()?;
         self.set_characteristic_notification(characteristic, true)
             .await
     }
 
     async fn unsubscribe(&self, characteristic: &Characteristic) -> Result<()> {
-        self.ensure_available()?;
         self.set_characteristic_notification(characteristic, false)
             .await
     }
 
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
         use futures::stream::StreamExt;
-        let stream = self.with_obj(|_env, obj| JSendStream::try_from(obj.get_notifications()?))?;
+        let shared = self.shared.clone();
+        let stream = self.with_obj(|env, obj| {
+            let stream = obj.get_notifications(env)?;
+            Ok(JSendStream::new(env, &stream)?)
+        })?;
         let stream = stream
-            .map(|item| match item {
-                Ok(item) => with_local_env(|env| {
-                    let item = env.new_local_ref(item.as_obj())?;
-                    let characteristic = JBluetoothGattCharacteristic::from_env(env, item)?;
-                    let uuid = characteristic.get_uuid()?;
-                    let value = characteristic.get_value()?;
-                    Ok(ValueNotification { uuid, value })
-                }),
-                Err(err) => Err(err),
-            })
-            .take_while(|item| {
-                if let Err(err) = item {
-                    log::warn!("BLE notification stream failed: {err}");
+            .map(move |item| match item {
+                Ok(item) => {
+                    let vm = jvm()?;
+                    let result: crate::Result<_> = vm
+                        .attach_current_thread(|env| -> jni::errors::Result<_> {
+                            let local_obj = env.new_local_ref(item.as_obj())?;
+                            let characteristic =
+                                env.cast_local::<JBluetoothGattCharacteristic>(local_obj)?;
+                            let uuid = characteristic.get_uuid(env)?;
+                            let value = characteristic.get_value(env)?;
+                            let service_uuid = shared
+                                .lock()
+                                .ok()
+                                .and_then(|guard| {
+                                    guard
+                                        .services
+                                        .iter()
+                                        .find(|s| s.characteristics.iter().any(|c| c.uuid == uuid))
+                                        .map(|s| s.uuid)
+                                })
+                                .unwrap_or_default();
+                            Ok(ValueNotification {
+                                uuid,
+                                service_uuid,
+                                value,
+                            })
+                        })
+                        .map_err(Into::into);
+                    result
                 }
-                futures::future::ready(item.is_ok())
+                Err(err) => Err(err.into()),
             })
             .filter_map(|item| async { item.ok() });
         Ok(Box::pin(stream))
     }
 
-    async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
-        self.ensure_available()?;
+    async fn read_rssi(&self) -> Result<i16> {
         let future = self.with_obj(|env, obj| {
-            let mut local_env = unsafe { env.unsafe_clone() };
-            let characteristic = JUuid::new(&mut local_env, descriptor.characteristic_uuid)?;
-            let uuid = JUuid::new(&mut local_env, descriptor.uuid)?;
-            let data_obj = jni_utils::arrays::slice_to_byte_array(&mut local_env, data)?;
-            JSendFuture::try_from(obj.write_descriptor(characteristic, uuid, data_obj.into())?)
+            let rssi_obj = obj.read_remote_rssi(env)?;
+            let rssi_future = env.cast_local::<JFuture>(rssi_obj)?;
+            Ok(JSendFuture::new(env, &rssi_future)?)
         })?;
         let result_ref = future.await?;
-        consume_future_result(&result_ref, |_env, _obj| Ok(()))
+        self.with_obj(|env, _obj| {
+            let rssi_obj = get_poll_result(env, &result_ref)?;
+            let rssi_val = env
+                .call_method(&rssi_obj, jni_str!("intValue"), jni_sig!("()I"), &[])?
+                .i()?;
+            Ok(rssi_val as i16)
+        })
     }
 
-    async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
-        self.ensure_available()?;
+    async fn write_descriptor(&self, descriptor: &Descriptor, data: &[u8]) -> Result<()> {
         let future = self.with_obj(|env, obj| {
             let characteristic = JUuid::new(env, descriptor.characteristic_uuid)?;
             let uuid = JUuid::new(env, descriptor.uuid)?;
-            JSendFuture::try_from(obj.read_descriptor(characteristic, uuid)?)
+            let data_obj = super::jni_utils::arrays::slice_to_byte_array(env, data)?;
+            let future = obj.write_descriptor(env, &characteristic, &uuid, &data_obj.into())?;
+            Ok(JSendFuture::new(env, &future)?)
         })?;
         let result_ref = future.await?;
-        consume_future_result(&result_ref, |env, bytes| {
-            Ok(env.convert_byte_array(JByteArray::from(bytes))?)
+        self.with_obj(|env, _obj| get_poll_result(env, &result_ref).map(|_| {}))
+    }
+
+    async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
+        let future = self.with_obj(|env, obj| {
+            let characteristic = JUuid::new(env, descriptor.characteristic_uuid)?;
+            let uuid = JUuid::new(env, descriptor.uuid)?;
+            let future = obj.read_descriptor(env, &characteristic, &uuid)?;
+            Ok(JSendFuture::new(env, &future)?)
+        })?;
+        let result_ref = future.await?;
+        self.with_obj(|env, _obj| {
+            let bytes_obj = get_poll_result(env, &result_ref)?;
+            let bytes_arr =
+                unsafe { jni::objects::JByteArray::from_raw(env, bytes_obj.into_raw()) };
+            Ok(byte_array_to_vec(env, &bytes_arr)?)
+        })
+    }
+
+    async fn connection_parameters(&self) -> Result<Option<ConnectionParameters>> {
+        self.with_obj(|env, obj| {
+            obj.get_connection_parameters(env)
+                .map_err(|e| Error::Other(format!("{:?}", e).into()))
+        })
+    }
+
+    async fn request_connection_parameters(&self, preset: ConnectionParameterPreset) -> Result<()> {
+        let priority = match preset {
+            ConnectionParameterPreset::Balanced => 0,
+            ConnectionParameterPreset::ThroughputOptimized => 1,
+            ConnectionParameterPreset::PowerOptimized => 2,
+        };
+        self.with_obj(|env, obj| {
+            let success = obj
+                .request_connection_priority(env, priority)
+                .map_err(|e| Error::Other(format!("{:?}", e).into()))?;
+            if success {
+                Ok(())
+            } else {
+                Err(Error::RuntimeError(
+                    "requestConnectionPriority returned false".to_string(),
+                ))
+            }
         })
     }
 }

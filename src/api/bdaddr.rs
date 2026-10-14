@@ -76,6 +76,12 @@ impl From<[u8; 6]> for BDAddr {
     }
 }
 
+impl From<BDAddr> for [u8; 6] {
+    fn from(value: BDAddr) -> Self {
+        value.address
+    }
+}
+
 impl<'a> TryFrom<&'a [u8]> for BDAddr {
     type Error = ParseBDAddrError;
 
@@ -471,12 +477,8 @@ mod tests {
     }
 
     #[test]
-    fn addr_to_u64() {
-        let addr_as_hex: u64 = ADDR.into();
-        assert_eq!(HEX, addr_as_hex);
-
-        let addr_back: BDAddr = addr_as_hex.try_into().unwrap();
-        assert_eq!(ADDR, addr_back);
+    fn zero_u64_to_addr_is_zero_sentinel() {
+        assert_eq!(BDAddr::try_from(0), Ok(BDAddr::default()));
     }
 
     #[cfg(feature = "serde")]

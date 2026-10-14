@@ -11,7 +11,7 @@ pub use crate::corebluetooth::{
 };
 #[cfg(target_os = "android")]
 pub use crate::droidplug::{
-    adapter::Adapter, init, jni::global_jvm, manager::Manager, peripheral::Peripheral,
+    adapter::Adapter, init, jni::jvm as global_jvm, manager::Manager, peripheral::Peripheral,
     peripheral::PeripheralId,
 };
 #[cfg(target_os = "windows")]

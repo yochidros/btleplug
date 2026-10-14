@@ -33,15 +33,20 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
 use serde_cr as serde;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt::{self, Debug, Display, Formatter},
+    hash::Hash,
     pin::Pin,
+    time::Duration,
 };
 use uuid::Uuid;
 
 pub use self::bdaddr::{BDAddr, ParseBDAddrError};
 
 use crate::platform::PeripheralId;
+
+/// The default MTU size for a peripheral.
+pub const DEFAULT_MTU_SIZE: u16 = 23;
 
 #[cfg_attr(
     feature = "serde",
@@ -86,6 +91,8 @@ impl AddressType {
 pub struct ValueNotification {
     /// UUID of the characteristic that fired the notification.
     pub uuid: Uuid,
+    /// UUID of the service that contains the characteristic.
+    pub service_uuid: Uuid,
     /// The new value of the characteristic.
     pub value: Vec<u8>,
 }
@@ -179,8 +186,13 @@ pub struct PeripheralProperties {
     pub address: BDAddr,
     /// The type of address (either random or public)
     pub address_type: Option<AddressType>,
-    /// The local name. This is generally a human-readable string that identifies the type of device.
+    /// The GAP local name. This is generally a human-readable string that identifies the type of device.
     pub local_name: Option<String>,
+    /// The advertisement name. May be different than local_name.
+    pub advertisement_name: Option<String>,
+    /// The GAP appearance reported by this peripheral.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub appearance: Option<u16>,
     /// The transmission power level for the device
     pub tx_power_level: Option<i16>,
     /// The most recent Received Signal Strength Indicator for the device
@@ -209,6 +221,97 @@ pub struct ScanFilter {
     pub services: Vec<Uuid>,
 }
 
+/// Selects peripherals for [`Central::retrieve_peripherals`].
+///
+/// `None` leaves a selector unspecified; an explicitly empty selector matches nothing. Values
+/// within a selector are OR'ed, while the identifier and service selectors are combined as a
+/// union. Returned peripherals retain backend order and are deduplicated by identifier.
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct RetrievePeripheralsOptions {
+    /// Known peripheral identifiers to retrieve.
+    pub identifiers: Option<Vec<PeripheralId>>,
+    /// Service UUIDs used to retrieve connected peripherals.
+    pub services: Option<Vec<Uuid>>,
+}
+
+/// Returns whether a candidate identifier is included in an identifier selector.
+#[allow(dead_code)] // Used by platform-gated backend implementations.
+pub(crate) fn matches_identifier<T: Eq>(candidate: &T, requested: &[T]) -> bool {
+    requested.iter().any(|requested| requested == candidate)
+}
+
+/// Returns whether a candidate service set contains one of the requested services.
+#[allow(dead_code)] // Used by platform-gated backend implementations.
+pub(crate) fn matches_service(candidate_services: &[Uuid], requested: &[Uuid]) -> bool {
+    requested
+        .iter()
+        .any(|requested| candidate_services.contains(requested))
+}
+
+/// Returns whether a candidate matches either supplied selector.
+///
+/// A selector is considered supplied even when empty; in that case it matches nothing.
+#[allow(dead_code)] // Used by platform-gated backend implementations.
+pub(crate) fn matches_retrieval_selectors(
+    candidate_id: &PeripheralId,
+    candidate_services: &[Uuid],
+    options: &RetrievePeripheralsOptions,
+) -> bool {
+    let id_match = options
+        .identifiers
+        .as_deref()
+        .is_some_and(|requested| matches_identifier(candidate_id, requested));
+    let service_match = options
+        .services
+        .as_deref()
+        .is_some_and(|requested| matches_service(candidate_services, requested));
+
+    if options.identifiers.is_none() && options.services.is_none() {
+        true
+    } else {
+        id_match || service_match
+    }
+}
+
+/// Merges retrieved peripherals while preserving the first occurrence of each identifier.
+#[allow(dead_code)] // Used by platform-gated backend implementations.
+pub(crate) fn merge_retrieved_peripherals<P, K, F>(
+    peripherals: impl IntoIterator<Item = P>,
+    id: F,
+) -> Vec<P>
+where
+    K: Eq + Hash,
+    F: Fn(&P) -> K,
+{
+    let mut seen = HashSet::new();
+    peripherals
+        .into_iter()
+        .filter(|peripheral| seen.insert(id(peripheral)))
+        .collect()
+}
+
+/// Current BLE connection parameters as reported by the OS.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConnectionParameters {
+    /// Connection interval in microseconds (typically 7_500..4_000_000).
+    pub interval_us: u32,
+    /// Slave latency in number of connection events (0..499).
+    pub latency: u16,
+    /// Supervision timeout in microseconds (100_000..32_000_000).
+    pub supervision_timeout_us: u32,
+}
+
+/// Preferred connection parameter presets for requesting updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionParameterPreset {
+    /// Balanced between throughput and power (default).
+    Balanced,
+    /// Low latency, high throughput. Use temporarily for bulk transfers.
+    ThroughputOptimized,
+    /// Reduced power consumption, higher latency.
+    PowerOptimized,
+}
+
 /// The type of write operation to use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteType {
@@ -230,8 +333,16 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
     /// Returns the MAC address of the peripheral.
     fn address(&self) -> BDAddr;
 
-    /// Returns the set of properties associated with the peripheral. These may be updated over time
-    /// as additional advertising reports are received.
+    /// Returns the currently negotiated mtu size
+    fn mtu(&self) -> u16;
+
+    /// Returns the properties currently known for the peripheral.
+    ///
+    /// `Ok(Some(_))` contains a snapshot of the properties available to the backend. The snapshot
+    /// may be updated as additional advertising reports are received, and individual fields may be
+    /// unavailable (`None`) when the peripheral has not advertised them or the platform does not
+    /// expose them. `Ok(None)` means that the backend has no properties snapshot available yet;
+    /// callers should handle this case rather than assuming that properties are always available.
     async fn properties(&self) -> Result<Option<PeripheralProperties>>;
 
     /// The set of services we've discovered for this device. This will be empty until
@@ -250,20 +361,33 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
     /// Returns true iff we are currently connected to the device.
     async fn is_connected(&self) -> Result<bool>;
 
-    /// Returns the negotiated ATT MTU for this connection when available.
-    /// For CoreBluetooth, passing characteristics can influence the MTU calculation.
-    async fn mtu(&self, characteristics: Option<&[Characteristic]>) -> Result<u16>;
-
     /// Creates a connection to the device. If this method returns Ok there has been successful
     /// connection. Note that peripherals allow only one connection at a time. Operations that
     /// attempt to communicate with a device will fail until it is connected.
     async fn connect(&self) -> Result<()>;
+
+    /// Like [`connect`](Peripheral::connect), but returns [`Error::TimedOut`](crate::Error::TimedOut)
+    /// if the connection is not established within the given duration.
+    async fn connect_with_timeout(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, self.connect())
+            .await
+            .map_err(|_| crate::Error::TimedOut(timeout))?
+    }
 
     /// Terminates a connection to the device.
     async fn disconnect(&self) -> Result<()>;
 
     /// Discovers all services for the device, including their characteristics.
     async fn discover_services(&self) -> Result<()>;
+
+    /// Like [`discover_services`](Peripheral::discover_services), but returns
+    /// [`Error::TimedOut`](crate::Error::TimedOut) if discovery does not complete within the
+    /// given duration.
+    async fn discover_services_with_timeout(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, self.discover_services())
+            .await
+            .map_err(|_| crate::Error::TimedOut(timeout))?
+    }
 
     /// Write some data to the characteristic. Returns an error if the write couldn't be sent or (in
     /// the case of a write-with-response) if the device returns an error.
@@ -282,6 +406,7 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
     async fn subscribe(&self, characteristic: &Characteristic) -> Result<()>;
 
     /// Disables either notify or indicate (depending on support) for the specified characteristic.
+    /// Unsubscribing a characteristic that is not currently subscribed is not an error.
     async fn unsubscribe(&self, characteristic: &Characteristic) -> Result<()>;
 
     /// Returns a stream of notifications for characteristic value updates. The stream will receive
@@ -297,6 +422,41 @@ pub trait Peripheral: Send + Sync + Clone + Debug {
     /// Sends a read descriptor request to the device. Returns either an error if the request
     /// was not accepted or the response from the device.
     async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>>;
+
+    /// Returns current connection parameters, if available on this platform.
+    /// Returns `Ok(None)` if the platform doesn't support reading parameters.
+    /// Returns `Err` if not connected.
+    async fn connection_parameters(&self) -> Result<Option<ConnectionParameters>> {
+        Err(crate::Error::NotSupported(
+            "connection_parameters".to_string(),
+        ))
+    }
+
+    /// Request a connection parameter update using a preset.
+    /// This is a request — the remote device may accept or reject.
+    /// Returns `Err(NotSupported)` on platforms that don't support this.
+    async fn request_connection_parameters(
+        &self,
+        _preset: ConnectionParameterPreset,
+    ) -> Result<()> {
+        Err(crate::Error::NotSupported(
+            "request_connection_parameters".to_string(),
+        ))
+    }
+
+    /// Read the current RSSI (signal strength) for this peripheral, in dBm.
+    ///
+    /// Behavior varies by platform:
+    /// - **macOS/iOS/Android**: Actively reads RSSI from the connected device.
+    /// - **Linux**: Returns the latest RSSI from BlueZ device properties.
+    /// - **Windows**: Returns the most recent RSSI from advertisements
+    ///   (requires scanning to be active for fresh values).
+    ///
+    /// Returns `Err(NotConnected)` if not connected (except Windows, which may
+    /// return a cached scan value).
+    async fn read_rssi(&self) -> Result<i16> {
+        Err(crate::Error::NotSupported("read_rssi".to_string()))
+    }
 }
 
 #[cfg_attr(
@@ -323,6 +483,8 @@ pub enum CentralEvent {
     DeviceUpdated(PeripheralId),
     DeviceConnected(PeripheralId),
     DeviceDisconnected(PeripheralId),
+    /// Only emitted on the corebluetooth subsystem
+    DeviceServicesModified(PeripheralId),
     /// Emitted when a Manufacturer Data advertisement has been received from a device
     ManufacturerDataAdvertisement {
         id: PeripheralId,
@@ -337,6 +499,13 @@ pub enum CentralEvent {
     ServicesAdvertisement {
         id: PeripheralId,
         services: Vec<Uuid>,
+    },
+    /// Emitted when an RSSI (signal strength) update is received for a device.
+    /// This may come from advertisements during scanning, or from an active
+    /// `read_rssi()` call on connected platforms.
+    RssiUpdate {
+        id: PeripheralId,
+        rssi: i16,
     },
     StateUpdate(CentralState),
 }
@@ -367,11 +536,35 @@ pub trait Central: Send + Sync + Clone {
     /// may contain peripherals that are no longer available.
     async fn peripherals(&self) -> Result<Vec<Self::Peripheral>>;
 
+    /// Retrieves peripherals from the backend's connected-device or known-device source.
+    ///
+    /// Selectors are combined as a union: a peripheral is returned when its identifier matches
+    /// any requested identifier or its backend-reported services contain any requested service.
+    /// Results are in backend order and deduplicated by [`Peripheral::id`]. An explicitly empty
+    /// selector matches nothing. Backends without a retrieval source return
+    /// [`Error::NotSupported`](crate::Error::NotSupported) with `"retrieve_peripherals"`.
+    async fn retrieve_peripherals(
+        &self,
+        _options: RetrievePeripheralsOptions,
+    ) -> Result<Vec<Self::Peripheral>> {
+        Err(crate::Error::NotSupported(
+            "retrieve_peripherals".to_string(),
+        ))
+    }
+
     /// Returns a particular [`Peripheral`] by its address if it has been discovered.
     async fn peripheral(&self, id: &PeripheralId) -> Result<Self::Peripheral>;
 
     /// Add a [`Peripheral`] from a MAC address without a scan result. Not supported on all Bluetooth systems.
     async fn add_peripheral(&self, address: &PeripheralId) -> Result<Self::Peripheral>;
+
+    /// Clears the list of [`Peripheral`]s that have been discovered so far. Connected peripherals
+    /// should be disconnected before calling this method. On platforms that do not cache peripherals
+    /// locally (e.g. BlueZ on Linux), this is a no-op.
+    ///
+    /// On CoreBluetooth (macOS/iOS), any still-connected peripheral is disconnected as part of
+    /// clearing it, without emitting a [`CentralEvent::DeviceDisconnected`] event.
+    async fn clear_peripherals(&self) -> Result<()>;
 
     /// Get information about the Bluetooth adapter being used, such as the model or type.
     ///
@@ -379,11 +572,82 @@ pub trait Central: Send + Sync + Clone {
     /// be useful for debug logs.
     async fn adapter_info(&self) -> Result<String>;
 
+    /// Retrieve the Bluetooth address exposed by the local adapter, when available.
+    ///
+    /// `Ok(Some(address))` means the platform exposed a usable adapter Bluetooth address.
+    /// `Ok(None)` means the platform or its public API does not expose one. `Err` means
+    /// retrieving the adapter metadata failed operationally. This value is optional and is
+    /// not the portable adapter identity: callers should continue using the platform adapter
+    /// handle and [`PeripheralId`] for identity and lookup.
+    ///
+    /// ```no_run
+    /// # use btleplug::api::Central as _;
+    /// # async fn example(adapter: impl btleplug::api::Central) {
+    /// match adapter.adapter_address().await {
+    ///     Ok(Some(address)) => println!("adapter address: {address}"),
+    ///     Ok(None) => println!("adapter address is unavailable on this platform"),
+    ///     Err(error) => eprintln!("could not query adapter address: {error}"),
+    /// }
+    /// # }
+    /// ```
+    async fn adapter_address(&self) -> Result<Option<BDAddr>> {
+        Ok(None)
+    }
+
     /// Get information about the Bluetooth adapter state.
     async fn adapter_state(&self) -> Result<CentralState>;
 }
 
-/// The Manager is the entry point to the library, providing access to all the Bluetooth adapters on
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrieve_options_default_is_explicit() {
+        assert_eq!(RetrievePeripheralsOptions::default().identifiers, None);
+        assert_eq!(RetrievePeripheralsOptions::default().services, None);
+    }
+
+    #[test]
+    fn retrieve_empty_identifier_selector_matches_nothing() {
+        assert!(!matches_identifier(&1_u8, &[]));
+    }
+
+    #[test]
+    fn retrieve_empty_service_selector_matches_nothing() {
+        assert!(!matches_service(&[Uuid::nil()], &[]));
+        assert!(!matches_service(&[], &[Uuid::nil()]));
+    }
+
+    #[test]
+    fn retrieve_selector_matching_uses_any_value() {
+        assert!(matches_identifier(&2_u8, &[1, 2, 3]));
+        assert!(matches_service(
+            &[Uuid::nil()],
+            &[Uuid::from_u128(1), Uuid::nil()],
+        ));
+    }
+
+    #[test]
+    fn retrieve_unknown_identifiers_are_omitted() {
+        let requested = [1_u8, 2_u8];
+        assert!(!matches_identifier(&3, &requested));
+    }
+
+    #[test]
+    fn retrieve_order_is_preserved() {
+        let merged = merge_retrieved_peripherals([3_u8, 1, 2], |value| *value);
+        assert_eq!(merged, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn retrieve_results_are_deduplicated() {
+        let merged = merge_retrieved_peripherals([1_u8, 2, 1, 3, 2], |value| *value);
+        assert_eq!(merged, vec![1, 2, 3]);
+    }
+}
+
+/// The Manager is the entry point for the library, providing access to all Bluetooth adapters on
 /// the system. You can obtain an instance from [`platform::Manager::new()`](crate::platform::Manager::new).
 ///
 /// ## Usage
@@ -408,4 +672,32 @@ pub trait Manager {
 
     /// Get a list of all Bluetooth adapters on the system. Each adapter implements [`Central`].
     async fn adapters(&self) -> Result<Vec<Self::Adapter>>;
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::PeripheralProperties;
+
+    #[test]
+    fn peripheral_properties_round_trip_appearance() {
+        let properties = PeripheralProperties {
+            appearance: Some(0x0340),
+            ..PeripheralProperties::default()
+        };
+
+        let value = serde_json::to_value(&properties).unwrap();
+        assert_eq!(value["appearance"], 0x0340);
+
+        let decoded: PeripheralProperties = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.appearance, Some(0x0340));
+    }
+
+    #[test]
+    fn peripheral_properties_missing_appearance_defaults_to_none() {
+        let mut value = serde_json::to_value(PeripheralProperties::default()).unwrap();
+        value.as_object_mut().unwrap().remove("appearance").unwrap();
+
+        let properties: PeripheralProperties = serde_json::from_value(value).unwrap();
+        assert_eq!(properties.appearance, None);
+    }
 }

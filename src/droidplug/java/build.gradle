@@ -1,30 +1,18 @@
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-    }
-    dependencies {
-        classpath 'com.android.tools.build:gradle:7.4.2'
-    }
-}
-
-
 plugins {
     id 'com.android.library'
 }
 
-
 repositories {
-    mavenLocal()
     google()
     mavenCentral()
 }
 
 android {
-    compileSdkVersion 34
+    namespace 'com.nonpolynomial.btleplug.android'
+    compileSdk 34
 
     defaultConfig {
-        minSdkVersion 23
+        minSdk 24
         versionCode 1
         versionName '0.7.3'
     }
@@ -36,6 +24,12 @@ android {
 }
 
 dependencies {
-    implementation 'io.github.gedgygedgy.rust:jni-utils:0.1.1-SNAPSHOT'
-    //implementation files('c:/Users/qdot/code/jni-utils-rs/java/build/libs/jni-utils-0.1.1-SNAPSHOT.jar')
+    testImplementation 'junit:junit:4.13.2'
+}
+
+tasks.register('testJar', Jar) {
+    archiveBaseName = 'btleplug-jni'
+    from compileDebugJavaWithJavac.destinationDirectory
+    destinationDirectory = file("$buildDir/libs")
+    dependsOn 'compileDebugJavaWithJavac'
 }

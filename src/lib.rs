@@ -22,7 +22,7 @@
 //! ```rust,no_run
 //! use btleplug::api::{bleuuid::uuid_from_u16, Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
 //! use btleplug::platform::{Adapter, Manager, Peripheral};
-//! use rand::{Rng, rng};
+//! use rand::{RngExt, rng};
 //! use std::error::Error;
 //! use std::thread;
 //! use std::time::Duration;
@@ -89,6 +89,8 @@ use crate::api::ParseBDAddrError;
 use std::result;
 use std::time::Duration;
 
+#[cfg(any(target_os = "android", target_os = "windows", test))]
+mod advertisement;
 pub mod api;
 #[cfg(target_os = "linux")]
 mod bluez;
@@ -98,6 +100,11 @@ mod common;
 mod corebluetooth;
 #[cfg(target_os = "android")]
 mod droidplug;
+#[cfg(all(not(target_os = "android"), feature = "jni-host-tests"))]
+#[allow(dead_code)]
+mod droidplug {
+    mod jni_utils;
+}
 pub mod platform;
 #[cfg(feature = "serde")]
 pub mod serde;
@@ -125,6 +132,9 @@ pub enum Error {
     #[error("No such characteristic")]
     NoSuchCharacteristic,
 
+    #[error("No Bluetooth adapter available")]
+    NoAdapterAvailable,
+
     #[error("The operation is not supported: {}", _0)]
     NotSupported(String),
 
@@ -144,7 +154,7 @@ pub enum Error {
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// Convert [`PoisonError`] to [`Error`] for replace `unwrap` to `map_err`
+/// Convert [`PoisonError`](std::sync::PoisonError) to [`Error`] so lock results can use `?`
 impl<T: std::fmt::Debug> From<std::sync::PoisonError<T>> for Error {
     fn from(e: std::sync::PoisonError<T>) -> Self {
         Self::Other(format!("{:?}", e).into())

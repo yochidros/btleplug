@@ -2,10 +2,10 @@
 // Big Sur or later.
 
 use btleplug::api::{
-    bleuuid::uuid_from_u16, Central, Manager as _, Peripheral as _, ScanFilter, WriteType,
+    Central, Manager as _, Peripheral as _, ScanFilter, WriteType, bleuuid::uuid_from_u16,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
-use rand::{rng, Rng};
+use rand::{RngExt, rng};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("Unable to fetch adapter list.")
         .into_iter()
-        .nth(0)
+        .next()
         .expect("Unable to find adapters.");
 
     // start scanning for devices
@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
             0xAA,
         ];
         light
-            .write(&cmd_char, &color_cmd, WriteType::WithoutResponse)
+            .write(cmd_char, &color_cmd, WriteType::WithoutResponse)
             .await?;
         time::sleep(Duration::from_millis(200)).await;
     }
