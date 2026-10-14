@@ -13,8 +13,7 @@ use jni::{
     JNIEnv,
 };
 use jni_utils::{
-    arrays::byte_array_to_vec, exceptions::try_block, future::JSendFuture, stream::JSendStream,
-    task::JPollResult, uuid::JUuid,
+    exceptions::try_block, future::JSendFuture, stream::JSendStream, task::JPollResult, uuid::JUuid,
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -156,9 +155,11 @@ fn poll_result_from_future<'a>(
             return if env.is_instance_of(
                 &ex,
                 <&JClass>::from(
-                    jni_utils::classcache::get_class("io/github/gedgygedgy/rust/future/FutureException")
-                        .unwrap()
-                        .as_obj(),
+                    jni_utils::classcache::get_class(
+                        "io/github/gedgygedgy/rust/future/FutureException",
+                    )
+                    .unwrap()
+                    .as_obj(),
                 ),
             )? {
                 Err(map_future_exception(env, ex)?)
@@ -198,8 +199,30 @@ fn get_poll_result<'a>(env: &mut JNIEnv<'a>, result: JPollResult<'a>) -> Result<
     }
 }
 
+pub(crate) fn with_local_env<T, E>(
+    f: impl for<'a> FnOnce(&mut JNIEnv<'a>) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E>
+where
+    E: From<jni::errors::Error>,
+{
+    let mut env = global_jvm().get_env()?;
+    env.with_local_frame(64, f)
+}
+
+fn consume_future_result<T>(
+    result_ref: &GlobalRef,
+    f: impl for<'a> FnOnce(&mut JNIEnv<'a>, JObject<'a>) -> Result<T>,
+) -> Result<T> {
+    with_local_env(|env| {
+        let result = poll_result_from_future(env, result_ref)?;
+        let obj = get_poll_result(env, result)?;
+        f(env, obj)
+    })
+}
+
 #[derive(Debug)]
 struct PeripheralShared {
+    connected: bool,
     services: BTreeSet<Service>,
     characteristics: BTreeSet<Characteristic>,
     properties: Option<PeripheralProperties>,
@@ -227,6 +250,7 @@ impl Peripheral {
             internal: env.new_global_ref(&obj_ref)?,
             adapter: manager,
             shared: Arc::new(Mutex::new(PeripheralShared {
+                connected: false,
                 services: BTreeSet::new(),
                 characteristics: BTreeSet::new(),
                 properties: None,
@@ -240,6 +264,14 @@ impl Peripheral {
         guard.properties = Some(properties);
     }
 
+    pub(crate) fn report_connected(&self, connected: bool) {
+        self.shared.lock().unwrap().connected = connected;
+    }
+
+    pub(crate) fn is_cache_only(&self) -> bool {
+        Arc::strong_count(&self.shared) == 1 && !self.shared.lock().unwrap().connected
+    }
+
     fn with_obj<T, E>(
         &self,
         f: impl for<'a> FnOnce(&mut JNIEnv<'a>, JPeripheral<'a>) -> std::result::Result<T, E>,
@@ -247,18 +279,19 @@ impl Peripheral {
     where
         E: From<::jni::errors::Error>,
     {
-        let mut env = global_jvm().get_env()?;
-        if env.exception_check()? {
-            env.exception_clear()?;
-            return Err(::jni::errors::Error::JavaException.into());
-        }
-        let obj = env.new_local_ref(self.internal.as_obj())?;
-        if env.exception_check()? {
-            env.exception_clear()?;
-            return Err(::jni::errors::Error::JavaException.into());
-        }
-        let obj = JPeripheral::from_env(&mut env, obj)?;
-        f(&mut env, obj)
+        with_local_env(|env| {
+            if env.exception_check()? {
+                env.exception_clear()?;
+                return Err(::jni::errors::Error::JavaException.into());
+            }
+            let obj = env.new_local_ref(self.internal.as_obj())?;
+            if env.exception_check()? {
+                env.exception_clear()?;
+                return Err(::jni::errors::Error::JavaException.into());
+            }
+            let obj = JPeripheral::from_env(env, obj)?;
+            f(env, obj)
+        })
     }
 
     async fn set_characteristic_notification(
@@ -272,9 +305,7 @@ impl Peripheral {
             JSendFuture::try_from(obj.set_characteristic_notification(uuid_obj, enable)?)
         })?;
         let result_ref = future.await?;
-        let mut env = global_jvm().get_env()?;
-        let result = poll_result_from_future(&mut env, &result_ref)?;
-        get_poll_result(&mut env, result).map(|_| {})
+        consume_future_result(&result_ref, |_env, _obj| Ok(()))
     }
 
     fn ensure_available(&self) -> Result<()> {
@@ -344,18 +375,17 @@ impl api::Peripheral for Peripheral {
         self.ensure_available()?;
         let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.connect()?))?;
         let result_ref = future.await?;
-        let mut env = global_jvm().get_env()?;
-        let result = poll_result_from_future(&mut env, &result_ref)?;
-        get_poll_result(&mut env, result).map(|_| {})
+        consume_future_result(&result_ref, |_env, _obj| Ok(()))?;
+        // 完了通知が接続イベントより先に届いても、ハンドルを返す前に保護する。
+        self.report_connected(true);
+        Ok(())
     }
 
     async fn disconnect(&self) -> Result<()> {
         self.ensure_available()?;
         let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.disconnect()?))?;
         let result_ref = future.await?;
-        let mut env = global_jvm().get_env()?;
-        let result = poll_result_from_future(&mut env, &result_ref)?;
-        get_poll_result(&mut env, result).map(|_| {})
+        consume_future_result(&result_ref, |_env, _obj| Ok(()))
     }
 
     /// The set of services we've discovered for this device. This will be empty until
@@ -369,52 +399,52 @@ impl api::Peripheral for Peripheral {
         self.ensure_available()?;
         let future = self.with_obj(|_env, obj| JSendFuture::try_from(obj.discover_services()?))?;
         let result_ref = future.await?;
-        let mut env = global_jvm().get_env()?;
         use std::iter::FromIterator;
+        let (peripheral_services, peripheral_characteristics) =
+            consume_future_result(&result_ref, |env, obj| {
+                let list = JList::from_env(env, &obj)?;
+                let mut peripheral_services = Vec::new();
+                let mut peripheral_characteristics = Vec::new();
 
-        let result = poll_result_from_future(&mut env, &result_ref)?;
-        let obj = get_poll_result(&mut env, result)?;
-        let list = JList::from_env(&mut env, &obj)?;
-        let mut peripheral_services = Vec::new();
-        let mut peripheral_characteristics = Vec::new();
-
-        let mut iter = list.iter(&mut env)?;
-        while let Some(service) = iter.next(&mut env)? {
-            let service = JBluetoothGattService::from_env(&mut env, service)?;
-            let mut characteristics = BTreeSet::<Characteristic>::new();
-            for characteristic in service.get_characteristics()? {
-                let mut descriptors = BTreeSet::new();
-                for descriptor in characteristic.get_descriptors()? {
-                    descriptors.insert(Descriptor {
-                        uuid: descriptor.get_uuid()?,
-                        service_uuid: service.get_uuid()?,
-                        characteristic_uuid: characteristic.get_uuid()?,
-                    });
+                let mut iter = list.iter(env)?;
+                while let Some(service) = iter.next(env)? {
+                    let service = JBluetoothGattService::from_env(env, service)?;
+                    let mut characteristics = BTreeSet::<Characteristic>::new();
+                    for characteristic in service.get_characteristics()? {
+                        let mut descriptors = BTreeSet::new();
+                        for descriptor in characteristic.get_descriptors()? {
+                            descriptors.insert(Descriptor {
+                                uuid: descriptor.get_uuid()?,
+                                service_uuid: service.get_uuid()?,
+                                characteristic_uuid: characteristic.get_uuid()?,
+                            });
+                        }
+                        let char = Characteristic {
+                            service_uuid: service.get_uuid()?,
+                            uuid: characteristic.get_uuid()?,
+                            properties: characteristic.get_properties()?,
+                            descriptors: descriptors.clone(),
+                        };
+                        // Only consider the first characteristic of each UUID
+                        // This "should" be unique, but of course it's not enforced
+                        if characteristics
+                            .iter()
+                            .filter(|c| c.service_uuid == char.service_uuid && c.uuid == char.uuid)
+                            .count()
+                            == 0
+                        {
+                            characteristics.insert(char.clone());
+                            peripheral_characteristics.push(char.clone());
+                        }
+                    }
+                    peripheral_services.push(Service {
+                        uuid: service.get_uuid()?,
+                        primary: service.is_primary()?,
+                        characteristics,
+                    })
                 }
-                let char = Characteristic {
-                    service_uuid: service.get_uuid()?,
-                    uuid: characteristic.get_uuid()?,
-                    properties: characteristic.get_properties()?,
-                    descriptors: descriptors.clone(),
-                };
-                // Only consider the first characteristic of each UUID
-                // This "should" be unique, but of course it's not enforced
-                if characteristics
-                    .iter()
-                    .filter(|c| c.service_uuid == char.service_uuid && c.uuid == char.uuid)
-                    .count()
-                    == 0
-                {
-                    characteristics.insert(char.clone());
-                    peripheral_characteristics.push(char.clone());
-                }
-            }
-            peripheral_services.push(Service {
-                uuid: service.get_uuid()?,
-                primary: service.is_primary()?,
-                characteristics,
-            })
-        }
+                Ok((peripheral_services, peripheral_characteristics))
+            })?;
         let mut guard = self.shared.lock().map_err(Into::<Error>::into)?;
         guard.services = BTreeSet::from_iter(peripheral_services.clone());
         guard.characteristics = BTreeSet::from_iter(peripheral_characteristics.clone());
@@ -439,9 +469,7 @@ impl api::Peripheral for Peripheral {
             JSendFuture::try_from(obj.write(uuid, data_obj.into(), write_type)?)
         })?;
         let result_ref = future.await?;
-        let mut env = global_jvm().get_env()?;
-        let result = poll_result_from_future(&mut env, &result_ref)?;
-        get_poll_result(&mut env, result).map(|_| {})
+        consume_future_result(&result_ref, |_env, _obj| Ok(()))
     }
 
     async fn read(&self, characteristic: &Characteristic) -> Result<Vec<u8>> {
@@ -451,11 +479,9 @@ impl api::Peripheral for Peripheral {
             JSendFuture::try_from(obj.read(uuid)?)
         })?;
         let result_ref = future.await?;
-        let mut env = global_jvm().get_env()?;
-        let result = poll_result_from_future(&mut env, &result_ref)?;
-        let bytes = get_poll_result(&mut env, result)?;
-        let mut local_env = unsafe { env.unsafe_clone() };
-        Ok(byte_array_to_vec(&mut local_env, JByteArray::from(bytes))?)
+        consume_future_result(&result_ref, |env, bytes| {
+            Ok(env.convert_byte_array(JByteArray::from(bytes))?)
+        })
     }
 
     async fn subscribe(&self, characteristic: &Characteristic) -> Result<()> {
@@ -475,15 +501,20 @@ impl api::Peripheral for Peripheral {
         let stream = self.with_obj(|_env, obj| JSendStream::try_from(obj.get_notifications()?))?;
         let stream = stream
             .map(|item| match item {
-                Ok(item) => {
-                    let mut env = global_jvm().get_env()?;
+                Ok(item) => with_local_env(|env| {
                     let item = env.new_local_ref(item.as_obj())?;
-                    let characteristic = JBluetoothGattCharacteristic::from_env(&mut env, item)?;
+                    let characteristic = JBluetoothGattCharacteristic::from_env(env, item)?;
                     let uuid = characteristic.get_uuid()?;
                     let value = characteristic.get_value()?;
                     Ok(ValueNotification { uuid, value })
-                }
+                }),
                 Err(err) => Err(err),
+            })
+            .take_while(|item| {
+                if let Err(err) = item {
+                    log::warn!("BLE notification stream failed: {err}");
+                }
+                futures::future::ready(item.is_ok())
             })
             .filter_map(|item| async { item.ok() });
         Ok(Box::pin(stream))
@@ -499,9 +530,7 @@ impl api::Peripheral for Peripheral {
             JSendFuture::try_from(obj.write_descriptor(characteristic, uuid, data_obj.into())?)
         })?;
         let result_ref = future.await?;
-        let mut env = global_jvm().get_env()?;
-        let result = poll_result_from_future(&mut env, &result_ref)?;
-        get_poll_result(&mut env, result).map(|_| {})
+        consume_future_result(&result_ref, |_env, _obj| Ok(()))
     }
 
     async fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
@@ -512,10 +541,8 @@ impl api::Peripheral for Peripheral {
             JSendFuture::try_from(obj.read_descriptor(characteristic, uuid)?)
         })?;
         let result_ref = future.await?;
-        let mut env = global_jvm().get_env()?;
-        let result = poll_result_from_future(&mut env, &result_ref)?;
-        let bytes = get_poll_result(&mut env, result)?;
-        let mut local_env = unsafe { env.unsafe_clone() };
-        Ok(byte_array_to_vec(&mut local_env, JByteArray::from(bytes))?)
+        consume_future_result(&result_ref, |env, bytes| {
+            Ok(env.convert_byte_array(JByteArray::from(bytes))?)
+        })
     }
 }

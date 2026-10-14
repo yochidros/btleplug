@@ -12,6 +12,7 @@ import android.util.Log;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
@@ -369,6 +370,12 @@ class Peripheral {
     public Stream<BluetoothGattCharacteristic> getNotifications() {
         QueueStream<BluetoothGattCharacteristic> stream = new QueueStream<>();
         synchronized (this) {
+            Iterator<WeakReference<QueueStream<BluetoothGattCharacteristic>>> iterator = this.notificationStreams.iterator();
+            while (iterator.hasNext()) {
+                if (iterator.next().get() == null) {
+                    iterator.remove();
+                }
+            }
             this.notificationStreams.add(new WeakReference<>(stream));
         }
         return stream;
@@ -593,9 +600,12 @@ class Peripheral {
             BluetoothGattCharacteristic characteristic2 = new BluetoothGattCharacteristic(characteristic.getUuid(), characteristic.getProperties(), characteristic.getPermissions());
             characteristic2.setValue(characteristic.getValue());
             synchronized (Peripheral.this) {
-                for (WeakReference<QueueStream<BluetoothGattCharacteristic>> ref : Peripheral.this.notificationStreams) {
-                    QueueStream<BluetoothGattCharacteristic> stream = ref.get();
-                    if (stream != null) {
+                Iterator<WeakReference<QueueStream<BluetoothGattCharacteristic>>> iterator = Peripheral.this.notificationStreams.iterator();
+                while (iterator.hasNext()) {
+                    QueueStream<BluetoothGattCharacteristic> stream = iterator.next().get();
+                    if (stream == null) {
+                        iterator.remove();
+                    } else {
                         stream.add(characteristic2);
                     }
                 }

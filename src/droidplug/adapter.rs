@@ -3,7 +3,7 @@ use super::{
         global_jvm,
         objects::{JScanFilter, JScanResult},
     },
-    peripheral::{Peripheral, PeripheralId},
+    peripheral::{with_local_env, Peripheral, PeripheralId},
 };
 use crate::{
     api::{BDAddr, Central, CentralEvent, CentralState, PeripheralProperties, ScanFilter},
@@ -24,6 +24,9 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+
+// 接続中・利用中の端末は上限より優先して保持する。
+const DISCOVERY_CACHE_LIMIT: usize = 256;
 
 #[derive(Clone)]
 pub struct Adapter {
@@ -91,11 +94,18 @@ impl Adapter {
     }
 
     fn add(&self, address: BDAddr) -> Result<Peripheral> {
-        let mut env = global_jvm().get_env()?;
-        let adapter_obj = env.new_local_ref(self.internal.as_obj())?;
-        let peripheral = Peripheral::new(&mut env, adapter_obj, address, Arc::downgrade(&self.manager))?;
+        let peripheral = with_local_env(|env| {
+            let adapter_obj = env.new_local_ref(self.internal.as_obj())?;
+            Peripheral::new(env, adapter_obj, address, Arc::downgrade(&self.manager))
+        })?;
         self.manager.add_peripheral(peripheral.clone());
+        self.prune_discovery_cache();
         Ok(peripheral)
+    }
+
+    fn prune_discovery_cache(&self) {
+        self.manager
+            .prune_peripherals(DISCOVERY_CACHE_LIMIT, Peripheral::is_cache_only);
     }
 
     fn report_properties(
@@ -140,25 +150,29 @@ impl Central for Adapter {
     }
 
     async fn start_scan(&self, filter: ScanFilter) -> Result<()> {
-        let mut env = global_jvm().get_env()?;
-        let filter = JScanFilter::new(&mut env, filter)?;
-        let filter_obj: JObject = filter.into();
-        env.call_method(
-            &self.internal,
-            "startScan",
-            "(Lcom/nonpolynomial/btleplug/android/impl/ScanFilter;)V",
-            &[JValue::from(&filter_obj)],
-        )?;
-        Ok(())
+        self.prune_discovery_cache();
+        with_local_env(|env| {
+            let filter = JScanFilter::new(env, filter)?;
+            let filter_obj: JObject = filter.into();
+            env.call_method(
+                &self.internal,
+                "startScan",
+                "(Lcom/nonpolynomial/btleplug/android/impl/ScanFilter;)V",
+                &[JValue::from(&filter_obj)],
+            )?;
+            Ok(())
+        })
     }
 
     async fn stop_scan(&self) -> Result<()> {
         let mut env = global_jvm().get_env()?;
         env.call_method(&self.internal, "stopScan", "()V", &[])?;
+        self.prune_discovery_cache();
         Ok(())
     }
 
     async fn peripherals(&self) -> Result<Vec<Peripheral>> {
+        self.prune_discovery_cache();
         Ok(self.manager.peripherals())
     }
 
@@ -197,6 +211,9 @@ pub(crate) fn adapter_on_connection_state_changed_internal(
     let addr_str = addr_str.to_str().map_err(|e| Error::Other(e.into()))?;
     let adapter = unsafe { env.get_rust_field::<_, _, Adapter>(obj, "handle")? };
     let addr = BDAddr::from_str(addr_str)?;
+    if let Some(peripheral) = adapter.manager.peripheral(&PeripheralId(addr)) {
+        peripheral.report_connected(connected != 0);
+    }
     adapter.manager.emit(if connected != 0 {
         CentralEvent::DeviceConnected(PeripheralId(addr))
     } else {
